@@ -9,39 +9,44 @@ from stable_baselines3.common.vec_env import DummyVecEnv
 import gymnasium as gym
 from sklearn.preprocessing import StandardScaler
 import plotly.graph_objects as go
+from datetime import datetime, timedelta
+import requests
 
 # --- 1. SETTINGS & STATE ---
-st.set_page_config(page_title="Quant Tournament", layout="wide")
+st.set_page_config(page_title="Quant Alpha Tournament", layout="wide")
 
 if 'results' not in st.session_state: st.session_state.results = None
 if 'forecast' not in st.session_state: st.session_state.forecast = None
 
 TARGET_ETFS = ['TLT', 'TBT', 'VNQ', 'GLD', 'SLV']
 MACRO = ['^VIX', '^TNX', 'DX-Y.NYB']
+FRED_API_KEY = st.secrets.get("FRED_API_KEY")
 
-# --- 2. MODEL ARCHITECTURES ---
-class CNN_LSTM(nn.Module):
-    def __init__(self, in_dim, out_dim):
-        super().__init__()
-        self.conv = nn.Conv1d(in_dim, 32, 3, padding=1)
-        self.lstm = nn.LSTM(32, 64, batch_first=True)
-        self.fc = nn.Linear(64, out_dim)
-    def forward(self, x):
-        # x shape: [batch, seq, features] -> transpose for CNN: [batch, features, seq]
-        x = x.transpose(1, 2)
-        x = torch.relu(self.conv(x)).transpose(1, 2)
-        _, (hn, _) = self.lstm(x)
-        return self.fc(hn[-1])
+# --- 2. ANALYTICS UTILITIES ---
+def get_sofr_rate(api_key):
+    """Fetches the latest SOFR (Secured Overnight Financing Rate) from FRED."""
+    if not api_key: return 0.053  # Current estimated risk-free rate if no key
+    url = f"https://api.stlouisfed.org/fred/series/observations?series_id=SOFR&api_key={api_key}&file_type=json"
+    try:
+        r = requests.get(url, timeout=10).json()
+        latest_val = float(r['observations'][-1]['value'])
+        return latest_val / 100
+    except: return 0.053
+
+def calculate_sharpe(returns, rf_rate):
+    """Calculates the annualized Sharpe Ratio against SOFR."""
+    returns = np.array(returns)
+    daily_rf = rf_rate / 252
+    excess_returns = returns - daily_rf
+    if np.std(excess_returns) == 0: return 0
+    return (np.mean(excess_returns) / np.std(excess_returns)) * np.sqrt(252)
 
 # --- 3. RL ENVIRONMENT ---
 class TradingEnv(gym.Env):
     def __init__(self, features, returns, etfs):
         super().__init__()
-        self.features = features
-        self.returns = returns
-        self.etfs = etfs
+        self.features, self.returns, self.etfs = features, returns, etfs
         self.action_space = gym.spaces.Discrete(len(etfs))
-        # Fixed dimensioning: the observation space must match X_sc width
         self.observation_space = gym.spaces.Box(low=-np.inf, high=np.inf, shape=(features.shape[1],), dtype=np.float32)
         self.current_step = 0
     def reset(self, seed=None):
@@ -51,103 +56,102 @@ class TradingEnv(gym.Env):
         reward = float(self.returns[self.current_step, action])
         self.current_step += 1
         done = self.current_step >= len(self.features) - 1
-        obs = self.features[self.current_step]
-        return obs, reward, done, False, {}
+        return self.features[self.current_step], reward, done, False, {}
 
-# --- 4. ENGINE ---
-def run_full_tournament(data):
-    # Calculate returns and lagged features
+# --- 4. TOURNAMENT ENGINE ---
+def run_full_tournament(data, rf_rate):
     rets_df = data[TARGET_ETFS].pct_change().dropna()
     feats_df = data.shift(1).dropna()
     common_idx = rets_df.index.intersection(feats_df.index)
-    
-    X = feats_df.loc[common_idx].values
-    y = rets_df.loc[common_idx].values
+    X, y = feats_df.loc[common_idx].values, rets_df.loc[common_idx].values
     
     scaler = StandardScaler()
     X_sc = scaler.fit_transform(X).astype(np.float32)
-    
     split = int(len(X_sc) * 0.8)
-    X_train, X_test = X_sc[:split], X_sc[split:]
-    y_train, y_test = y[:split], y[split:]
-
-    # RL Models (PPO & A2C)
-    def make_env(): return TradingEnv(X_train, y_train, TARGET_ETFS)
-    env = DummyVecEnv([make_env])
     
-    ppo = PPO("MlpPolicy", env, verbose=0).learn(total_timesteps=1200)
+    # Train Models
+    env = DummyVecEnv([lambda: TradingEnv(X_sc[:split], y[:split], TARGET_ETFS)])
+    ppo = PPO("MlpPolicy", env, verbose=0).learn(total_timesteps=1500)
     a2c = A2C("MlpPolicy", env, verbose=0).learn(total_timesteps=1200)
     
-    # DL Model (CNN-LSTM)
-    model = CNN_LSTM(X.shape[1], len(TARGET_ETFS))
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.005)
-    X_t = torch.tensor(X_train).unsqueeze(1) # [batch, seq=1, features]
-    y_t = torch.tensor(y_train).float()
+    # Out-of-Sample Backtest
+    results = {"PPO": [], "A2C": [], "Equal-Weight": []}
+    dates = common_idx[split:]
+    X_test, y_test = X_sc[split:], y[split:]
     
-    for _ in range(30):
-        optimizer.zero_grad()
-        loss = nn.MSELoss()(model(X_t), y_t)
-        loss.backward()
-        optimizer.step()
-
-    # Backtest Loop
-    results = {"PPO": [], "A2C": [], "CNN-LSTM": []}
     for i in range(len(X_test)):
-        # PPO & A2C Predictions
         p_act, _ = ppo.predict(X_test[i], deterministic=True)
         a_act, _ = a2c.predict(X_test[i], deterministic=True)
-        
-        # CNN-LSTM Prediction
-        with torch.no_grad():
-            c_out = model(torch.tensor(X_test[i]).reshape(1, 1, -1))
-            c_act = torch.argmax(c_out).item()
-            
         results["PPO"].append(y_test[i, p_act])
         results["A2C"].append(y_test[i, a_act])
-        results["CNN-LSTM"].append(y_test[i, c_act])
+        results["Equal-Weight"].append(np.mean(y_test[i]))
 
-    # Final Forecast for Tomorrow
+    # Final Forecast for the upcoming session
     latest_feat = X_sc[-1:]
-    final_act, _ = ppo.predict(latest_feat[0], deterministic=True)
-    forecast = {"ETF": TARGET_ETFS[final_act], "Model": "PPO (Best Adaptive)"}
+    f_act, _ = ppo.predict(latest_feat[0], deterministic=True)
     
-    return results, common_idx[split:], forecast
+    # 15-Day Trade Audit History
+    audit_data = []
+    for j in range(len(X_test)-15, len(X_test)):
+        idx_j = j
+        act, _ = ppo.predict(X_test[idx_j], deterministic=True)
+        audit_data.append({
+            'Date': dates[idx_j].strftime('%Y-%m-%d'),
+            'Ticker': TARGET_ETFS[act],
+            'Daily Return': results["PPO"][idx_j]
+        })
+    history_df = pd.DataFrame(audit_data)
 
-# --- 5. UI ---
-st.title("🏆 Advanced Multi-Model Alpha Tournament")
+    return results, dates, TARGET_ETFS[f_act], history_df
 
-@st.cache_data
-def load_market_data():
-    return yf.download(TARGET_ETFS + MACRO, start="2018-01-01", progress=False)['Close'].ffill().dropna()
+# --- 5. UI & DASHBOARD ---
+st.title("🏆 Advanced Alpha Tournament")
 
-data = load_market_data()
+# Calculate Market Open Date
+now = datetime.now()
+target_date = now if now.hour < 16 else now + timedelta(days=1)
+while target_date.weekday() >= 5: target_date += timedelta(days=1)
+st.sidebar.subheader("📅 Target Market Session")
+st.sidebar.info(f"Predictions applicable for:\n**{target_date.strftime('%A, %b %d, %Y')}**")
 
-if st.button("🚀 Run Tournament"):
-    with st.status("Training RL Agents and Neural Networks...") as status:
-        res, dates, fc = run_full_tournament(data)
-        st.session_state.results = (res, dates)
-        st.session_state.forecast = fc
-        status.update(label="Tournament Analysis Finished!", state="complete")
+if st.button("🚀 Run Analysis & Backtest"):
+    with st.status("Analyzing Market Regimes...") as status:
+        rf = get_sofr_rate(FRED_API_KEY)
+        data = yf.download(TARGET_ETFS + MACRO, start="2018-01-01", progress=False)['Close'].ffill().dropna()
+        res, dates, fc_ticker, hist = run_full_tournament(data, rf)
+        st.session_state.results = (res, dates, rf)
+        st.session_state.forecast = (fc_ticker, hist)
+        status.update(label="Analysis Complete!", state="complete")
     st.rerun()
 
 if st.session_state.results:
-    res, dates = st.session_state.results
-    fc = st.session_state.forecast
+    res, dates, rf = st.session_state.results
+    fc_ticker, hist = st.session_state.forecast
+    
+    # Summary Metrics
+    st.header(f"🎯 Next Trade: {fc_ticker}")
+    
+    col1, col2, col3 = st.columns(3)
+    ppo_rets = np.array(res["PPO"])
+    annualized_return = (np.prod(1 + ppo_rets)**(252/len(ppo_rets)) - 1)
+    
+    col1.metric("PPO Annualized Return", f"{annualized_return:.2%}", delta="Best Performer")
+    col2.metric("Sharpe Ratio (vs SOFR)", f"{calculate_sharpe(res['PPO'], rf):.2f}")
+    col3.metric("Risk-Free Rate (SOFR)", f"{rf:.2%}")
 
-    # 1. Prediction for Tomorrow
-    st.header(f"🎯 Forecast for Next Session: {fc['ETF']}")
-    st.success(f"The **{fc['Model']}** recommends a long position in **{fc['ETF']}** based on current macro regimes.")
-
-    # 2. Results Comparison
-    st.subheader("📊 Performance Leaderboard")
-    cols = st.columns(3)
+    # Sharpe Leaderboard
+    st.subheader("📊 Efficiency Comparison")
+    l_cols = st.columns(3)
     for i, (name, r) in enumerate(res.items()):
-        cum_ret = (np.prod(1 + np.array(r)) - 1)
-        cols[i].metric(name, f"{cum_ret:.2%}")
+        l_cols[i].metric(f"{name} Sharpe", f"{calculate_sharpe(r, rf):.2f}")
 
-    # 3. Charting
+    # Chart
     fig = go.Figure()
     for name, r in res.items():
         fig.add_trace(go.Scatter(x=dates, y=np.cumprod(1 + np.array(r)), name=name))
-    fig.update_layout(title="Equity Curves (Out-of-Sample)", template="plotly_dark")
+    fig.update_layout(title="Equity Curves (Out-of-Sample)", template="plotly_dark", height=500)
     st.plotly_chart(fig, use_container_width=True)
+
+    # 15-Day Audit
+    st.subheader("📅 Last 15 Sessions: Trade Audit")
+    st.table(hist.sort_values('Date', ascending=False).style.format({'Daily Return': '{:.2%}'}))

@@ -56,6 +56,7 @@ class TradingEnv(gym.Env):
         self.etfs = etfs
         self.feature_cols = feature_cols
         self.action_space = gym.spaces.Discrete(len(etfs))
+        # Fixed: Force observation shape to match feature count exactly
         self.observation_space = gym.spaces.Box(
             low=-np.inf, 
             high=np.inf, 
@@ -110,6 +111,7 @@ def run_tournament(data):
     idx = rets.index.intersection(features.index)
     X, y = features.loc[idx], rets.loc[idx]
     
+    # Track explicit feature names to ensure alignment
     feature_cols = X.columns.tolist()
     
     seq_len = 10
@@ -137,7 +139,7 @@ def run_tournament(data):
 
     results = {}
     
-    # RL MODELS (PPO & A2C)
+    # RL MODELS
     train_obs = X_train_sc[:, -1, :]
     train_env_df = pd.DataFrame(train_obs, columns=feature_cols)
     for i, col in enumerate(TARGET_ETFS):
@@ -153,6 +155,7 @@ def run_tournament(data):
     
     ppo_actions, a2c_actions = [], []
     for obs in X_live_sc[:, -1, :]:
+        # Fixed: Predict with correct batch shape (1, num_features)
         p_act, _ = ppo.predict(np.array([obs]), deterministic=True)
         a_act, _ = a2c.predict(np.array([obs]), deterministic=True)
         ppo_actions.append(p_act[0])
@@ -161,7 +164,7 @@ def run_tournament(data):
     results['PPO'] = [y_live[i, a] for i, a in enumerate(ppo_actions)]
     results['A2C'] = [y_live[i, a] for i, a in enumerate(a2c_actions)]
 
-    # SEQUENCE MODELS (CNN-LSTM & Transformer)
+    # SEQUENCE MODELS
     X_t = torch.tensor(X_train_sc, dtype=torch.float32)
     y_t = torch.tensor(y_train, dtype=torch.float32)
     X_l_t = torch.tensor(X_live_sc, dtype=torch.float32)
@@ -183,18 +186,18 @@ def run_tournament(data):
 
 # --- 6. UI ---
 st.title("🏆 Advanced Quant Alpha Tournament")
-st.markdown("Comparing **PPO, A2C, CNN-LSTM, and Transformer** on identical macro regimes.")
+st.markdown("---")
 
 if not FRED_API_KEY:
     st.error("Please add FRED_API_KEY to your Streamlit Secrets.")
 else:
     df_raw = get_master_data(FRED_API_KEY)
     if not df_raw.empty:
-        with st.status("Analyzing Market Regimes...", expanded=True) as status:
+        with st.status("Initializing Tournament...", expanded=True) as status:
             tournament_res, dates = run_tournament(df_raw)
-            status.update(label="Tournament Analysis Complete!", state="complete", expanded=False)
+            status.update(label="Analysis Complete!", state="complete", expanded=False)
         
-        st.subheader("📊 Performance Leaderboard (Out-of-Sample)")
+        st.subheader("📊 Performance Leaderboard")
         summary = []
         fig = go.Figure()
         for name, rets in tournament_res.items():
@@ -203,11 +206,10 @@ else:
             fig.add_trace(go.Scatter(x=dates, y=np.cumprod(1 + np.array(rets)), name=name))
         
         st.table(pd.DataFrame(summary).sort_values("Cumulative Return", ascending=False))
-        fig.update_layout(title="Equity Curve Comparison", template="plotly_dark", height=450)
         st.plotly_chart(fig, use_container_width=True)
 
         target_date = get_next_market_date()
-        st.subheader(f"🎯 Forecasts for US Open: {target_date}")
+        st.subheader(f"🎯 Forecast for: {target_date}")
         cols = st.columns(len(tournament_res))
         for i, (name, rets) in enumerate(tournament_res.items()):
             cols[i].metric(name, "BUY SIGNAL", delta="Active")

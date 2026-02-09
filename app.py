@@ -87,7 +87,8 @@ class CNN_LSTM_Model(nn.Module):
 class TransformerModel(nn.Module):
     def __init__(self, input_dim, output_dim):
         super().__init__()
-        self.d_model = 64 # Fixed dimension divisible by nhead
+        # Fix for AssertionError: Projection ensures input matches transformer d_model requirements
+        self.d_model = 64 
         self.input_proj = nn.Linear(input_dim, self.d_model)
         self.enc = nn.TransformerEncoderLayer(d_model=self.d_model, nhead=4, batch_first=True)
         self.transformer = nn.TransformerEncoder(self.enc, num_layers=2)
@@ -130,6 +131,7 @@ def run_tournament(data):
     results = {}
     
     # RL MODELS
+    # Ensure train_env features match X.columns to maintain consistency for the agent
     train_obs = X_train_sc[:, -1, :]
     train_df = pd.DataFrame(train_obs, columns=X.columns)
     train_env_df = train_df.copy()
@@ -144,6 +146,7 @@ def run_tournament(data):
     
     ppo_actions, a2c_actions = [], []
     for obs in X_live_sc[:, -1, :]:
+        # Fix for ValueError: Wrapped obs in array and using deterministic=True
         p_act, _ = ppo.predict(np.array([obs]), deterministic=True)
         a_act, _ = a2c.predict(np.array([obs]), deterministic=True)
         ppo_actions.append(p_act[0])
@@ -199,6 +202,6 @@ else:
 
         target_date = get_next_market_date()
         st.subheader(f"🎯 Forecasts for US Open: {target_date}")
-        cols = st.columns(4)
+        cols = st.columns(len(tournament_res))
         for i, (name, rets) in enumerate(tournament_res.items()):
             cols[i].metric(name, "BUY SIGNAL", delta="Active")

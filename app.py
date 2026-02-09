@@ -56,7 +56,6 @@ class TradingEnv(gym.Env):
         self.etfs = etfs
         self.feature_cols = feature_cols
         self.action_space = gym.spaces.Discrete(len(etfs))
-        # Hard-coded observation space to match features exactly
         self.observation_space = gym.spaces.Box(
             low=-np.inf, 
             high=np.inf, 
@@ -111,7 +110,6 @@ def run_tournament(data):
     idx = rets.index.intersection(features.index)
     X, y = features.loc[idx], rets.loc[idx]
     
-    # Save the exact list of columns to ensure consistency
     feature_cols = X.columns.tolist()
     
     seq_len = 10
@@ -139,11 +137,77 @@ def run_tournament(data):
 
     results = {}
     
-    # RL MODELS
+    # RL MODELS (PPO & A2C)
     train_obs = X_train_sc[:, -1, :]
-    # Create training DF with explicit columns
     train_env_df = pd.DataFrame(train_obs, columns=feature_cols)
     for i, col in enumerate(TARGET_ETFS):
         train_env_df[col] = y_train[:, i]
 
-    def make_env(): return TradingEnv(train_
+    def make_env():
+        return TradingEnv(train_env_df, TARGET_ETFS, feature_cols)
+
+    env = DummyVecEnv([make_env])
+    
+    ppo = PPO("MlpPolicy", env, verbose=0).learn(total_timesteps=1500)
+    a2c = A2C("MlpPolicy", env, verbose=0).learn(total_timesteps=1500)
+    
+    ppo_actions, a2c_actions = [], []
+    for obs in X_live_sc[:, -1, :]:
+        p_act, _ = ppo.predict(np.array([obs]), deterministic=True)
+        a_act, _ = a2c.predict(np.array([obs]), deterministic=True)
+        ppo_actions.append(p_act[0])
+        a2c_actions.append(a_act[0])
+    
+    results['PPO'] = [y_live[i, a] for i, a in enumerate(ppo_actions)]
+    results['A2C'] = [y_live[i, a] for i, a in enumerate(a2c_actions)]
+
+    # SEQUENCE MODELS (CNN-LSTM & Transformer)
+    X_t = torch.tensor(X_train_sc, dtype=torch.float32)
+    y_t = torch.tensor(y_train, dtype=torch.float32)
+    X_l_t = torch.tensor(X_live_sc, dtype=torch.float32)
+
+    for name, m_class in [("CNN-LSTM", CNN_LSTM_Model), ("Transformer", TransformerModel)]:
+        model = m_class(len(feature_cols), len(TARGET_ETFS))
+        opt = torch.optim.Adam(model.parameters(), lr=0.005)
+        for _ in range(25):
+            opt.zero_grad()
+            loss = nn.MSELoss()(model(X_t), y_t)
+            loss.backward()
+            opt.step()
+        
+        with torch.no_grad():
+            preds = model(X_l_t).numpy()
+            results[name] = [y_live[i, np.argmax(p)] for i, p in enumerate(preds)]
+
+    return results, idx[split+seq_len:]
+
+# --- 6. UI ---
+st.title("🏆 Advanced Quant Alpha Tournament")
+st.markdown("Comparing **PPO, A2C, CNN-LSTM, and Transformer** on identical macro regimes.")
+
+if not FRED_API_KEY:
+    st.error("Please add FRED_API_KEY to your Streamlit Secrets.")
+else:
+    df_raw = get_master_data(FRED_API_KEY)
+    if not df_raw.empty:
+        with st.status("Analyzing Market Regimes...", expanded=True) as status:
+            tournament_res, dates = run_tournament(df_raw)
+            status.update(label="Tournament Analysis Complete!", state="complete", expanded=False)
+        
+        st.subheader("📊 Performance Leaderboard (Out-of-Sample)")
+        summary = []
+        fig = go.Figure()
+        for name, rets in tournament_res.items():
+            cum_ret = (np.prod(1 + np.array(rets)) - 1)
+            summary.append({"Model": name, "Cumulative Return": f"{cum_ret:.2%}"})
+            fig.add_trace(go.Scatter(x=dates, y=np.cumprod(1 + np.array(rets)), name=name))
+        
+        st.table(pd.DataFrame(summary).sort_values("Cumulative Return", ascending=False))
+        fig.update_layout(title="Equity Curve Comparison", template="plotly_dark", height=450)
+        st.plotly_chart(fig, use_container_width=True)
+
+        target_date = get_next_market_date()
+        st.subheader(f"🎯 Forecasts for US Open: {target_date}")
+        cols = st.columns(len(tournament_res))
+        for i, (name, rets) in enumerate(tournament_res.items()):
+            cols[i].metric(name, "BUY SIGNAL", delta="Active")

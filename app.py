@@ -87,7 +87,7 @@ class CNN_LSTM_Model(nn.Module):
 class TransformerModel(nn.Module):
     def __init__(self, input_dim, output_dim):
         super().__init__()
-        self.d_model = 64 # Forced dimension divisible by heads
+        self.d_model = 64 # Fixed dimension divisible by nhead
         self.input_proj = nn.Linear(input_dim, self.d_model)
         self.enc = nn.TransformerEncoderLayer(d_model=self.d_model, nhead=4, batch_first=True)
         self.transformer = nn.TransformerEncoder(self.enc, num_layers=2)

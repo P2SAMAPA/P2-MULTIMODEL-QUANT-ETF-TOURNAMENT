@@ -55,7 +55,7 @@ class TradingEnv(gym.Env):
         self.df = df
         self.etfs = etfs
         self.action_space = gym.spaces.Discrete(len(etfs))
-        self.observation_space = gym.spaces.Box(low=-5, high=5, shape=(df.shape[1],), dtype=np.float32)
+        self.observation_space = gym.spaces.Box(low=-10, high=10, shape=(df.shape[1],), dtype=np.float32)
         self.current_step = 0
 
     def reset(self, seed=None, options=None):
@@ -96,14 +96,12 @@ class TransformerModel(nn.Module):
         return self.fc(x[:, -1, :])
 
 # --- 5. TOURNAMENT ENGINE ---
-def run_tournament(data, hold_period):
-    # Prep Features & Labels
+def run_tournament(data):
     rets = data[TARGET_ETFS].pct_change().dropna()
     features = data.shift(1).dropna()
     idx = rets.index.intersection(features.index)
     X, y = features.loc[idx], rets.loc[idx]
     
-    # Sequence Processing (10-day lookback)
     seq_len = 10
     X_s, y_s = [], []
     for i in range(len(X) - seq_len):
@@ -111,12 +109,10 @@ def run_tournament(data, hold_period):
         y_s.append(y.iloc[i+seq_len].values)
     X_s, y_s = np.array(X_s), np.array(y_s)
 
-    # Split 80/20
     split = int(len(X_s) * 0.8)
     X_train, X_live = X_s[:split], X_s[split:]
     y_train, y_live = y_s[:split], y_s[split:]
 
-    # Scaling
     scaler = StandardScaler()
     X_train_flat = X_train.reshape(-1, X_train.shape[-1])
     scaler.fit(X_train_flat)
@@ -125,21 +121,21 @@ def run_tournament(data, hold_period):
 
     results = {}
     
-    # A. RL MODELS (PPO & A2C)
-    # Flattening data for standard SB3 MLP Policies
+    # RL MODELS (PPO & A2C)
     rl_train_df = pd.DataFrame(X_train_sc[:, -1, :]).join(pd.DataFrame(y_train, columns=TARGET_ETFS))
     env = DummyVecEnv([lambda: TradingEnv(rl_train_df, TARGET_ETFS)])
     
-    ppo = PPO("MlpPolicy", env, verbose=0).learn(total_timesteps=2000)
-    a2c = A2C("MlpPolicy", env, verbose=0).learn(total_timesteps=2000)
+    ppo = PPO("MlpPolicy", env, verbose=0).learn(total_timesteps=1500)
+    a2c = A2C("MlpPolicy", env, verbose=0).learn(total_timesteps=1500)
     
-    ppo_actions = [ppo.predict(obs)[0] for obs in X_live_sc[:, -1, :]]
-    a2c_actions = [a2c.predict(obs)[0] for obs in X_live_sc[:, -1, :]]
+    # FIX: Reshape observation to (1, -1) for SB3 prediction
+    ppo_actions = [ppo.predict(obs.reshape(1, -1))[0][0] for obs in X_live_sc[:, -1, :]]
+    a2c_actions = [a2c.predict(obs.reshape(1, -1))[0][0] for obs in X_live_sc[:, -1, :]]
     
     results['PPO'] = [y_live[i, a] for i, a in enumerate(ppo_actions)]
     results['A2C'] = [y_live[i, a] for i, a in enumerate(a2c_actions)]
 
-    # B. SEQUENCE MODELS (CNN-LSTM & Transformer)
+    # SEQUENCE MODELS (CNN-LSTM & Transformer)
     X_t = torch.tensor(X_train_sc, dtype=torch.float32)
     y_t = torch.tensor(y_train, dtype=torch.float32)
     X_l_t = torch.tensor(X_live_sc, dtype=torch.float32)
@@ -147,7 +143,7 @@ def run_tournament(data, hold_period):
     for name, m_class in [("CNN-LSTM", CNN_LSTM_Model), ("Transformer", TransformerModel)]:
         model = m_class(X_t.shape[2], len(TARGET_ETFS))
         opt = torch.optim.Adam(model.parameters(), lr=0.005)
-        for _ in range(20):
+        for _ in range(25):
             opt.zero_grad()
             loss = nn.MSELoss()(model(X_t), y_t)
             loss.backward()
@@ -161,14 +157,15 @@ def run_tournament(data, hold_period):
 
 # --- 6. UI ---
 st.title("🏆 Advanced Quant Alpha Tournament")
-st.markdown("---")
+st.markdown("Comparing **PPO, A2C, CNN-LSTM, and Transformer** on identical macro regimes.")
 
 if not FRED_API_KEY:
-    st.error("Add FRED_API_KEY to Streamlit Secrets.")
+    st.error("Please add FRED_API_KEY to your Streamlit Secrets.")
 else:
     df_raw = get_master_data(FRED_API_KEY)
     if not df_raw.empty:
-        tournament_res, dates = run_tournament(df_raw, 1)
+        with st.spinner("Training models for current market regime..."):
+            tournament_res, dates = run_tournament(df_raw)
         
         # Leaderboard Summary
         st.subheader("📊 Performance Leaderboard (Out-of-Sample)")

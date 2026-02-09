@@ -44,7 +44,6 @@ def fetch_fred_yield(api_key):
 def get_master_data(api_key):
     all_tickers = TARGET_ETFS + YAHOO_MACRO
     combined = pd.DataFrame()
-    
     for attempt in range(3):
         try:
             raw = yf.download(all_tickers, start="2010-01-01", auto_adjust=True, progress=False)
@@ -53,8 +52,7 @@ def get_master_data(api_key):
                 combined = prices
                 break
         except Exception:
-            time.sleep(5 * (attempt + 1))
-            
+            time.sleep(5)
     fred_df = fetch_fred_yield(api_key)
     if not combined.empty:
         combined = pd.concat([combined, fred_df], axis=1).ffill().dropna()
@@ -118,7 +116,6 @@ def run_tournament(data):
     features = data.shift(1).dropna()
     idx = rets.index.intersection(features.index)
     X, y = features.loc[idx], rets.loc[idx]
-    
     feature_cols = X.columns.tolist()
     seq_len = 10
     X_s, y_s = [], []
@@ -126,48 +123,33 @@ def run_tournament(data):
         X_s.append(X.iloc[i:i+seq_len].values)
         y_s.append(y.iloc[i+seq_len].values)
     X_s, y_s = np.array(X_s), np.array(y_s)
-
     split = int(len(X_s) * 0.8)
     X_train, X_live = X_s[:split], X_s[split:]
     y_train, y_live = y_s[:split], y_s[split:]
-
     scaler = StandardScaler()
     scaler.fit(X_train.reshape(-1, X_train.shape[-1]))
-    
     def scale_seq(seq_data):
         flat = seq_data.reshape(-1, seq_data.shape[-1])
         return scaler.transform(flat).reshape(seq_data.shape).astype(np.float32)
-
     X_train_sc, X_live_sc = scale_seq(X_train), scale_seq(X_live)
     results = {}
-    
-    # RL TRAINING
     train_obs = X_train_sc[:, -1, :]
     train_env_df = pd.DataFrame(train_obs, columns=feature_cols)
     for i, col in enumerate(TARGET_ETFS):
         train_env_df[col] = y_train[:, i]
-
     def make_env(): return TradingEnv(train_env_df, TARGET_ETFS, feature_cols)
     env = DummyVecEnv([make_env])
-    
     ppo = PPO("MlpPolicy", env, verbose=0).learn(total_timesteps=1500)
     a2c = A2C("MlpPolicy", env, verbose=0).learn(total_timesteps=1500)
-    
     ppo_actions, a2c_actions = [], []
     for obs in X_live_sc[:, -1, :]:
         p_act, _ = ppo.predict(np.array([obs]), deterministic=True)
         a_act, _ = a2c.predict(np.array([obs]), deterministic=True)
         ppo_actions.append(p_act[0])
         a2c_actions.append(a_act[0])
-    
     results['PPO'] = [y_live[i, a] for i, a in enumerate(ppo_actions)]
     results['A2C'] = [y_live[i, a] for i, a in enumerate(a2c_actions)]
-
-    # DL TRAINING - FIXED DTYPES
-    X_t = torch.tensor(X_train_sc).float()
-    y_t = torch.tensor(y_train).float()
-    X_l_t = torch.tensor(X_live_sc).float()
-
+    X_t, y_t, X_l_t = torch.tensor(X_train_sc).float(), torch.tensor(y_train).float(), torch.tensor(X_live_sc).float()
     for name, m_class in [("CNN-LSTM", CNN_LSTM_Model), ("Transformer", TransformerModel)]:
         model = m_class(len(feature_cols), len(TARGET_ETFS))
         opt = torch.optim.Adam(model.parameters(), lr=0.005)
@@ -175,11 +157,9 @@ def run_tournament(data):
             opt.zero_grad()
             nn.MSELoss()(model(X_t), y_t).backward()
             opt.step()
-        
         with torch.no_grad():
             preds = model(X_l_t).numpy()
             results[name] = [y_live[i, np.argmax(p)] for i, p in enumerate(preds)]
-
     return results, idx[split+seq_len:]
 
 # --- 6. UI ---
@@ -190,25 +170,26 @@ if not FRED_API_KEY:
 else:
     df_raw = get_master_data(FRED_API_KEY)
     if not df_raw.empty:
-        with st.status("Analyzing Market Regimes...", expanded=True) as status:
-            tournament_res, dates = run_tournament(df_raw)
-            status.update(label="Tournament Analysis Complete!", state="complete", expanded=False)
-        
-        st.subheader("📊 Performance Leaderboard (Out-of-Sample)")
-        summary = []
-        fig = go.Figure()
-        for name, rets in tournament_res.items():
-            cum_ret = (np.prod(1 + np.array(rets)) - 1)
-            summary.append({"Model": name, "Cumulative Return": f"{cum_ret:.2%}"})
-            fig.add_trace(go.Scatter(x=dates, y=np.cumprod(1 + np.array(rets)), name=name))
-        
-        st.table(pd.DataFrame(summary).sort_values("Cumulative Return", ascending=False))
-        st.plotly_chart(fig, use_container_width=True)
+        st.success("Market Data Loaded Successfully.")
+        if st.button("🚀 Start Tournament Analysis"):
+            with st.status("Training Multi-Model Ensemble...", expanded=True) as status:
+                tournament_res, dates = run_tournament(df_raw)
+                status.update(label="Analysis Complete!", state="complete", expanded=False)
+            
+            st.subheader("📊 Performance Leaderboard")
+            summary = []
+            fig = go.Figure()
+            for name, rets in tournament_res.items():
+                cum_ret = (np.prod(1 + np.array(rets)) - 1)
+                summary.append({"Model": name, "Cumulative Return": f"{cum_ret:.2%}"})
+                fig.add_trace(go.Scatter(x=dates, y=np.cumprod(1 + np.array(rets)), name=name))
+            st.table(pd.DataFrame(summary).sort_values("Cumulative Return", ascending=False))
+            st.plotly_chart(fig, use_container_width=True)
 
-        target_date = get_next_market_date()
-        st.subheader(f"🎯 Predictions for: {target_date}")
-        cols = st.columns(len(tournament_res))
-        for i, (name, rets) in enumerate(tournament_res.items()):
-            cols[i].metric(name, "BUY SIGNAL", delta="Active")
+            target_date = get_next_market_date()
+            st.subheader(f"🎯 Predictions for: {target_date}")
+            cols = st.columns(len(tournament_res))
+            for i, (name, rets) in enumerate(tournament_res.items()):
+                cols[i].metric(name, "BUY SIGNAL", delta="Active")
     else:
-        st.warning("Market data unavailable. Please check API keys or Yahoo Finance limits.")
+        st.warning("Data fetch failed. Please check your internet connection or API keys.")

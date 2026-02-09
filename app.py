@@ -55,19 +55,13 @@ class TradingEnv(gym.Env):
         self.df = df.reset_index(drop=True)
         self.etfs = etfs
         self.action_space = gym.spaces.Discrete(len(etfs))
-        # Match observation space exactly to the number of columns in df
-        self.observation_space = gym.spaces.Box(
-            low=-np.inf, 
-            high=np.inf, 
-            shape=(df.shape[1],), 
-            dtype=np.float32
-        )
+        self.observation_space = gym.spaces.Box(low=-np.inf, high=np.inf, shape=(df.shape[1],), dtype=np.float32)
         self.current_step = 0
 
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
         self.current_step = 0
-        obs = self.df.iloc[self.current_step].values.astype(np.float32)
+        obs = self.df.iloc[0].values.astype(np.float32)
         return obs, {}
 
     def step(self, action):
@@ -84,7 +78,6 @@ class CNN_LSTM_Model(nn.Module):
         self.cnn = nn.Conv1d(input_dim, 64, kernel_size=3, padding=1)
         self.lstm = nn.LSTM(64, 128, batch_first=True)
         self.fc = nn.Linear(128, output_dim)
-
     def forward(self, x):
         x = x.transpose(1, 2)
         x = torch.relu(self.cnn(x)).transpose(1, 2)
@@ -94,11 +87,13 @@ class CNN_LSTM_Model(nn.Module):
 class TransformerModel(nn.Module):
     def __init__(self, input_dim, output_dim):
         super().__init__()
-        self.enc = nn.TransformerEncoderLayer(d_model=input_dim, nhead=2, batch_first=True)
+        self.d_model = 64 # Forced dimension divisible by heads
+        self.input_proj = nn.Linear(input_dim, self.d_model)
+        self.enc = nn.TransformerEncoderLayer(d_model=self.d_model, nhead=4, batch_first=True)
         self.transformer = nn.TransformerEncoder(self.enc, num_layers=2)
-        self.fc = nn.Linear(input_dim, output_dim)
-
+        self.fc = nn.Linear(self.d_model, output_dim)
     def forward(self, x):
+        x = self.input_proj(x)
         x = self.transformer(x)
         return self.fc(x[:, -1, :])
 
@@ -134,27 +129,21 @@ def run_tournament(data):
 
     results = {}
     
-    # RL MODELS (PPO & A2C)
-    # The train_df must contain the same columns as the observation space expects
+    # RL MODELS
     train_obs = X_train_sc[:, -1, :]
     train_df = pd.DataFrame(train_obs, columns=X.columns)
-    # We add labels just so the Environment can calculate 'reward' during training
     train_env_df = train_df.copy()
-    for col in TARGET_ETFS:
-        train_env_df[col] = y_train[:, TARGET_ETFS.index(col)]
+    for i, col in enumerate(TARGET_ETFS):
+        train_env_df[col] = y_train[:, i]
 
-    def make_env():
-        return TradingEnv(train_env_df, TARGET_ETFS)
-
+    def make_env(): return TradingEnv(train_env_df, TARGET_ETFS)
     env = DummyVecEnv([make_env])
     
     ppo = PPO("MlpPolicy", env, verbose=0).learn(total_timesteps=2000)
     a2c = A2C("MlpPolicy", env, verbose=0).learn(total_timesteps=2000)
     
     ppo_actions, a2c_actions = [], []
-    # Predict on the live data
     for obs in X_live_sc[:, -1, :]:
-        # Wrap observation in a list to satisfy DummyVecEnv shape [1, n_features]
         p_act, _ = ppo.predict(np.array([obs]), deterministic=True)
         a_act, _ = a2c.predict(np.array([obs]), deterministic=True)
         ppo_actions.append(p_act[0])
@@ -163,7 +152,7 @@ def run_tournament(data):
     results['PPO'] = [y_live[i, a] for i, a in enumerate(ppo_actions)]
     results['A2C'] = [y_live[i, a] for i, a in enumerate(a2c_actions)]
 
-    # SEQUENCE MODELS (CNN-LSTM & Transformer)
+    # SEQUENCE MODELS
     X_t = torch.tensor(X_train_sc, dtype=torch.float32)
     y_t = torch.tensor(y_train, dtype=torch.float32)
     X_l_t = torch.tensor(X_live_sc, dtype=torch.float32)
@@ -196,22 +185,18 @@ else:
             tournament_res, dates = run_tournament(df_raw)
             status.update(label="Tournament Complete!", state="complete", expanded=False)
         
-        # Leaderboard Summary
         st.subheader("📊 Performance Leaderboard (Out-of-Sample)")
         summary = []
         fig = go.Figure()
-        
         for name, rets in tournament_res.items():
             cum_ret = (np.prod(1 + np.array(rets)) - 1)
             summary.append({"Model": name, "Cumulative Return": f"{cum_ret:.2%}"})
             fig.add_trace(go.Scatter(x=dates, y=np.cumprod(1 + np.array(rets)), name=name))
         
         st.table(pd.DataFrame(summary).sort_values("Cumulative Return", ascending=False))
-        
         fig.update_layout(title="Equity Curve Comparison", template="plotly_dark", height=450)
         st.plotly_chart(fig, use_container_width=True)
 
-        # Consensus Display
         target_date = get_next_market_date()
         st.subheader(f"🎯 Forecasts for US Open: {target_date}")
         cols = st.columns(4)

@@ -85,11 +85,12 @@ def run_tournament_engine(data_json, rf_rate):
     split = int(len(X_sc) * 0.8) 
     X_train, X_test, y_train, y_test = X_sc[:split], X_sc[split:], y[:split], y[split:]
 
-    # Training
+    # Training RL
     env = DummyVecEnv([lambda: TradingEnv(X_train, y_train, TARGET_ETFS)])
     ppo = PPO("MlpPolicy", env, verbose=0).learn(2000)
     a2c = A2C("MlpPolicy", env, verbose=0).learn(2000)
     
+    # Training DL
     dl_models = {}
     for name, m_class in [("CNN-LSTM", CNN_LSTM_Model), ("Transformer", TransformerModel)]:
         model = m_class(X.shape[1], len(TARGET_ETFS))
@@ -101,7 +102,7 @@ def run_tournament_engine(data_json, rf_rate):
             opt.step()
         dl_models[name] = model
 
-    # OOS Competition
+    # Tournament Competition
     results = {"PPO": [], "A2C": [], "CNN-LSTM": [], "Transformer": []}
     picks = {"PPO": [], "A2C": [], "CNN-LSTM": [], "Transformer": []}
     dates = common_idx[split:]
@@ -123,13 +124,16 @@ def run_tournament_engine(data_json, rf_rate):
     perf = {k: np.prod(1 + np.array(v)) for k, v in results.items()}
     champ = max(perf, key=perf.get)
     
-    # Monthly Return Calculation for Heatmap
-    champ_rets = pd.Series(results[champ], index=dates)
-    monthly_rets = champ_rets.groupby([champ_rets.index.year, champ_rets.index.month]).apply(lambda x: (np.prod(1+x)-1))
-    monthly_table = monthly_rets.unstack().fillna(0)
-    monthly_table.columns = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'][:len(monthly_table.columns)]
+    # Heatmap logic with Geometric Yearly Compounding
+    champ_series = pd.Series(results[champ], index=dates)
+    monthly_rets = champ_series.groupby([champ_series.index.year, champ_series.index.month]).apply(lambda x: np.prod(1+x)-1)
+    m_table = monthly_rets.unstack().fillna(0)
+    m_table.columns = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'][:len(m_table.columns)]
+    
+    # Geometric compounding for yearly total column
+    m_table['Yearly Total'] = m_table.apply(lambda row: np.prod(1 + row) - 1, axis=1)
 
-    # Forecast
+    # Next Day Forecast
     latest_feat = X_sc[-1:]
     if champ == "PPO": f_act, _ = ppo.predict(latest_feat[0], deterministic=True)
     elif champ == "A2C": f_act, _ = a2c.predict(latest_feat[0], deterministic=True)
@@ -146,10 +150,10 @@ def run_tournament_engine(data_json, rf_rate):
             'Outcome Return': results[champ][j]
         })
 
-    return results, dates, TARGET_ETFS[f_act], champ, pd.DataFrame(audit_list), monthly_table
+    return results, dates, TARGET_ETFS[f_act], champ, pd.DataFrame(audit_list), m_table
 
 # --- 5. UI ---
-st.title("Multi-model (DL & ML) Tournament for ETF Returns")
+st.title("Multi-model (DL & ML) Tournament for Prediction of ETF Returns")
 
 with st.sidebar:
     st.header("Tournament Configuration")
@@ -179,40 +183,45 @@ if st.session_state.results:
     m2.metric("Sharpe Ratio (Annualized)", f"{((np.mean(champ_rets_arr)-(s['rf']/252))/np.std(champ_rets_arr)*np.sqrt(252)):.2f}")
     m3.metric("Live SOFR Rate", f"{s['rf']:.2%}")
 
-    # Out of Sample Cumulative Return
+    # Chart
     fig = go.Figure()
     for name, r in s['res'].items():
         fig.add_trace(go.Scatter(x=s['dates'], y=np.cumprod(1 + np.array(r)), name=name))
     fig.update_layout(title=f"Out of Sample Cumulative Return (Training since {s['start']})", template="plotly_dark", height=400)
     st.plotly_chart(fig, use_container_width=True)
 
-    # Monthly Returns Table
-    st.subheader(f"📅 Monthly Returns Heatmap ({s['champ']})")
-    st.dataframe(s['monthly'].style.background_gradient(cmap='RdYlGn', axis=None).format("{:.2%}"), use_container_width=True)
-
-    # 15 Day Audit with Badges
-    st.subheader(f"📊 15-Day Audit Table ({s['champ']})")
+    # --- HEATMAP WITH CUSTOM COLOR SCHEME ---
+    st.subheader(f"📅 Monthly Performance Matrix ({s['champ']})")
     
-    def color_return(val):
+    def heatmap_style(val):
+        if val > 0:
+            return f'background-color: rgba(0, 128, 0, {min(val*5, 0.9)}); color: white;'
+        elif val < 0:
+            return f'background-color: rgba(255, 0, 0, {min(abs(val)*5, 0.9)}); color: white;'
+        return ''
+
+    styled_monthly = s['monthly'].style.applymap(heatmap_style).format("{:.2%}")
+    st.dataframe(styled_monthly, use_container_width=True)
+
+    # --- AUDIT TABLE ---
+    st.subheader(f"📊 15-Day Audit Table ({s['champ']})")
+    def audit_style(val):
         color = '#d1f2eb' if val > 0 else '#fcdedc'
         text_color = '#0e6251' if val > 0 else '#943126'
-        label = f"▲ {val:.2%}" if val > 0 else f"▼ {val:.2%}"
-        return f'background-color: {color}; color: {text_color}; border-radius: 12px; padding: 4px 10px; font-weight: bold; display: inline-block;'
+        return f'background-color: {color}; color: {text_color}; border-radius: 8px; font-weight: bold;'
 
-    # Applying custom HTML-like formatting via Pandas Styler
-    st.table(s['audit'].sort_values('Date', ascending=False).style.applymap(lambda x: 'font-weight: bold', subset=['ETF Picked'])
-             .format({'Outcome Return': '{:.2%}'})
-             .apply(lambda x: [color_return(v) if i == 'Outcome Return' else '' for i, v in x.items()], axis=1))
+    st.table(s['audit'].sort_values('Date', ascending=False).style.format({'Outcome Return': '{:.2%}'})
+             .applymap(audit_style, subset=['Outcome Return']))
 
-    # Methodology Section
+    # Methodology
     st.divider()
     st.header("🔍 Methodology & Model Architecture")
     col_a, col_b = st.columns(2)
     with col_a:
         st.subheader("Data Strategy: 80/20 Split")
-        st.write("The engine utilizes an 80:20 temporal split. 80% is used for training correlations, and 20% serves as a blind out-of-sample (OOS) test to select the Champion.")
+        [cite_start]st.write("The engine utilizes an 80:20 temporal split[cite: 26]. 80% is used for training, while the remaining 20% serves as a blind test to select the Champion.")
         st.subheader("7-Day Hard Refresh")
-        st.write("To prevent model staleness, the system deletes and retrains all models every 7 days, ensuring they adapt to current market volatility.")
+        st.write("The system retrains all models every 7 days via a TTL cache mechanism to ensure the models stay adapted to the latest market regime.")
     with col_b:
         st.subheader("The Competing Models")
-        st.markdown("1. **PPO:** Stable RL policy optimization. \n 2. **A2C:** Advantage-based trade actor. \n 3. **CNN-LSTM:** Spatial pattern & temporal trend hybrid. \n 4. **Transformer:** Attention-based macro correlation finder.")
+        st.markdown("1. **PPO:** Stable RL policy optimization. \n 2. **A2C:** Actor-critic RL agent. \n 3. **CNN-LSTM:** Spatial-temporal pattern learner. \n 4. **Transformer:** Attention-based macro correlation finder.")

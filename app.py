@@ -121,6 +121,7 @@ def run_tournament_engine(data_json, rf_rate):
     perf = {k: np.prod(1 + np.array(v)) for k, v in results.items()}
     champ = max(perf, key=perf.get)
     
+    # Process Monthly Table
     champ_series = pd.Series(results[champ], index=dates)
     monthly_rets = champ_series.groupby([champ_series.index.year, champ_series.index.month]).apply(lambda x: np.prod(1+x)-1)
     m_table = monthly_rets.unstack().fillna(0)
@@ -182,21 +183,27 @@ if st.session_state.results:
     fig.update_layout(title=f"Out of Sample Cumulative Return (Training since {s['start']})", template="plotly_dark", height=400)
     st.plotly_chart(fig, use_container_width=True)
 
+    # --- HEATMAP WITH CONTRAST CORRECTION ---
     st.subheader(f"📅 Monthly Performance Matrix ({s['champ']})")
     def heatmap_style(val):
+        alpha = min(abs(val)*6, 0.9) # Scaled alpha
+        text_color = "white" if alpha > 0.45 else "black" # High-contrast trigger
         if val > 0:
-            return f'background-color: rgba(0, 128, 0, {min(val*5, 0.9)}); color: white;'
+            return f'background-color: rgba(0, 128, 0, {alpha}); color: {text_color};'
         elif val < 0:
-            return f'background-color: rgba(255, 0, 0, {min(abs(val)*5, 0.9)}); color: white;'
-        return ''
+            return f'background-color: rgba(255, 0, 0, {alpha}); color: {text_color};'
+        return 'color: black;'
+
     styled_monthly = s['monthly'].style.applymap(heatmap_style).format("{:.2%}")
     st.dataframe(styled_monthly, use_container_width=True)
 
+    # --- AUDIT TABLE ---
     st.subheader(f"📊 15-Day Audit Table ({s['champ']})")
     def audit_style(val):
         color = '#d1f2eb' if val > 0 else '#fcdedc'
         text_color = '#0e6251' if val > 0 else '#943126'
         return f'background-color: {color}; color: {text_color}; border-radius: 8px; font-weight: bold;'
+    
     st.table(s['audit'].sort_values('Date', ascending=False).style.format({'Outcome Return': '{:.2%}'})
              .applymap(audit_style, subset=['Outcome Return']))
 

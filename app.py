@@ -13,7 +13,7 @@ from datetime import datetime, timedelta
 import requests
 
 # --- 1. SETTINGS & STATE ---
-st.set_page_config(page_title="Multi-model ETF Tournament", layout="wide")
+st.set_page_config(page_title="Alpha Tournament Pro", layout="wide")
 
 if 'results' not in st.session_state: st.session_state.results = None
 
@@ -48,7 +48,6 @@ class TransformerModel(nn.Module):
 
 # --- 3. UTILITIES ---
 def get_sofr_rate(api_key):
-    """Automatically fetches live SOFR from FRED."""
     if not api_key: return 0.053 
     url = f"https://api.stlouisfed.org/fred/series/observations?series_id=SOFR&api_key={api_key}&file_type=json"
     try:
@@ -72,7 +71,7 @@ class TradingEnv(gym.Env):
         done = self.current_step >= len(self.features) - 1
         return self.features[self.current_step], reward, done, False, {}
 
-# --- 4. ENGINE (80/20 Split with 7-Day TTL) ---
+# --- 4. ENGINE ---
 @st.cache_resource(ttl=604800)
 def run_tournament_engine(data_json, rf_rate):
     data = pd.read_json(data_json)
@@ -83,26 +82,27 @@ def run_tournament_engine(data_json, rf_rate):
     
     scaler = StandardScaler()
     X_sc = scaler.fit_transform(X).astype(np.float32)
-    split = int(len(X_sc) * 0.8) # 80% Training, 20% Out-of-Sample
+    split = int(len(X_sc) * 0.8) 
     X_train, X_test, y_train, y_test = X_sc[:split], X_sc[split:], y[:split], y[split:]
 
-    # A. Training
+    # A. Training (RL)
     env = DummyVecEnv([lambda: TradingEnv(X_train, y_train, TARGET_ETFS)])
     ppo = PPO("MlpPolicy", env, verbose=0).learn(2000)
     a2c = A2C("MlpPolicy", env, verbose=0).learn(2000)
     
+    # B. Training (DL)
     dl_models = {}
     for name, m_class in [("CNN-LSTM", CNN_LSTM_Model), ("Transformer", TransformerModel)]:
         model = m_class(X.shape[1], len(TARGET_ETFS))
         opt = torch.optim.Adam(model.parameters(), lr=0.005)
         X_t, y_t = torch.tensor(X_train).unsqueeze(1), torch.tensor(y_train).float()
-        for _ in range(25): # Optimized epochs for speed
+        for _ in range(25): 
             opt.zero_grad()
             nn.MSELoss()(model(X_t), y_t).backward()
             opt.step()
         dl_models[name] = model
 
-    # B. OOS Competition
+    # C. Out-of-Sample Performance
     results = {"PPO": [], "A2C": [], "CNN-LSTM": [], "Transformer": []}
     picks = {"PPO": [], "A2C": [], "CNN-LSTM": [], "Transformer": []}
     dates = common_idx[split:]
@@ -121,11 +121,10 @@ def run_tournament_engine(data_json, rf_rate):
                 results[name].append(y_test[i, act])
                 picks[name].append(TARGET_ETFS[act])
 
-    # C. Selection
     perf = {k: np.prod(1 + np.array(v)) for k, v in results.items()}
     champ = max(perf, key=perf.get)
     
-    # D. Next-Day Forecast
+    # Next Day Prediction
     latest_feat = X_sc[-1:]
     if champ == "PPO": f_act, _ = ppo.predict(latest_feat[0], deterministic=True)
     elif champ == "A2C": f_act, _ = a2c.predict(latest_feat[0], deterministic=True)
@@ -134,7 +133,6 @@ def run_tournament_engine(data_json, rf_rate):
             f_out = dl_models[champ](torch.tensor(latest_feat).reshape(1, 1, -1))
             f_act = torch.argmax(f_out).item()
 
-    # E. Audit
     audit_list = []
     for j in range(len(X_test)-15, len(X_test)):
         audit_list.append({
@@ -146,34 +144,40 @@ def run_tournament_engine(data_json, rf_rate):
     return results, dates, TARGET_ETFS[f_act], champ, pd.DataFrame(audit_list)
 
 # --- 5. UI ---
-st.title("Multi-model (DL & ML) Tournament for Prediction of ETF Returns")
+st.title("Alpha Tournament: Multi-model ETF Forecasting")
 
-st.markdown("""
-### The Models
-* **PPO:** Advanced Reinforcement Learning agent that optimizes for stability.
-* **A2C:** Fast RL agent that balances predicted value against actual trade outcomes.
-* **CNN-LSTM:** Deep Learning hybrid that uses spatial filters (CNN) for price patterns and temporal memory (LSTM) for trends.
-* **Transformer:** Attention-based model that weighs multiple macro-economic factors at once to find hidden correlations.
-""")
+with st.sidebar:
+    st.header("Tournament Configuration")
+    start_year = st.selectbox(
+        "Select Training Start Year",
+        options=["2007", "2010", "2015", "2019", "2021"],
+        index=0,
+        help="Older data provides more market cycles but takes longer to compute."
+    )
+    
+    if start_year == "2007":
+        st.warning("⚠️ Training from 2007 requires heavy computation and may take 2-4 minutes to complete.")
+    
+    run_btn = st.button("🚀 Execute Alpha Tournament")
 
 # Market Open Logic
 now = datetime.now()
 target_date = now if now.hour < 16 else now + timedelta(days=1)
 while target_date.weekday() >= 5: target_date += timedelta(days=1)
 
-if st.button("🚀 Run Full History Tournament (2007 - Present)"):
-    with st.status("Training on 18 Years of Data...") as status:
+if run_btn:
+    with st.status(f"Fetching data and training models since {start_year}...") as status:
         rf = get_sofr_rate(FRED_API_KEY)
-        raw_data = yf.download(TARGET_ETFS + MACRO, start="2007-01-01", progress=False)['Close'].ffill().dropna()
+        raw_data = yf.download(TARGET_ETFS + MACRO, start=f"{start_year}-01-01", progress=False)['Close'].ffill().dropna()
         res, dates, ticker, champ, audit = run_tournament_engine(raw_data.to_json(), rf)
-        st.session_state.results = {"res": res, "dates": dates, "ticker": ticker, "champ": champ, "audit": audit, "rf": rf}
+        st.session_state.results = {"res": res, "dates": dates, "ticker": ticker, "champ": champ, "audit": audit, "rf": rf, "start": start_year}
         status.update(label=f"Champion Identified: {champ}", state="complete")
     st.rerun()
 
 if st.session_state.results:
     s = st.session_state.results
     st.header(f"🎯 Forecast for {target_date.strftime('%b %d')}: BUY {s['ticker']}")
-    st.caption("Sharpe Ratio is calculated using live SOFR from FRED.")
+    st.info(f"Tournament results based on training data since {s['start']}.")
 
     m1, m2, m3 = st.columns(3)
     champ_rets = np.array(s['res'][s['champ']])
@@ -184,7 +188,7 @@ if st.session_state.results:
     fig = go.Figure()
     for name, r in s['res'].items():
         fig.add_trace(go.Scatter(x=s['dates'], y=np.cumprod(1 + np.array(r)), name=name))
-    fig.update_layout(title="Out of Sample Cumulative Return", template="plotly_dark", xaxis_title="Date", yaxis_title="Growth of $1")
+    fig.update_layout(title=f"Out of Sample Performance (Since {s['start']})", template="plotly_dark", xaxis_title="Date", yaxis_title="Growth of $1")
     st.plotly_chart(fig, use_container_width=True)
 
     st.subheader(f"📅 Last 15 Sessions Audit ({s['champ']})")

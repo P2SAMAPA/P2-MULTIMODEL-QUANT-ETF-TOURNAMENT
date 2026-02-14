@@ -374,7 +374,8 @@ def run_tournament_engine(features_json, returns_json, rf_rate, tcost_bps, start
         'split_date': split_date,
         'data_source': data_source,
         'best_lookback': best_lookback,
-        'num_features': X.shape[1]
+        'num_features': X.shape[1],
+        'train_test_split': '80/20'
     }
 
     return results, test_dates, forecasts, champ, runner_up, m_table, recency_scores, oos_years, diagnostics
@@ -432,17 +433,15 @@ if run_btn:
 if st.session_state.results:
     s = st.session_state.results
     
-    # Calculate OOS period length in years
-    oos_years_count = int(s['oos_years'].split('-')[1]) - int(s['oos_years'].split('-')[0]) + 1 if '-' in s['oos_years'] else 1
-    
     # --- CHAMPION ROW ---
     st.subheader(f"🏆 Champion: {s['champ']}")
     c1, c2, c3, c4 = st.columns(4)
     c_rets = np.array(s['res'][s['champ']])
     
-    # Calculate annualized return
+    # Calculate annualized return using ACTUAL trading days (proper method for daily returns)
     total_return_c = np.prod(1+c_rets) - 1
-    annualized_return_c = (1 + total_return_c) ** (1 / oos_years_count) - 1
+    num_trading_days_c = len(c_rets)
+    annualized_return_c = (1 + total_return_c) ** (252 / num_trading_days_c) - 1
     
     c1.metric(f"PREDICTION", s['fcasts'][s['champ']], delta=f"Valid: {s['next_day']}")
     c2.metric("Annualized Return (Net)", f"{annualized_return_c:.2%}", delta=f"OOS: {s['oos_years']}")
@@ -454,9 +453,10 @@ if st.session_state.results:
     r1, r2, r3, r4 = st.columns(4)
     r_rets = np.array(s['res'][s['runner']])
     
-    # Calculate annualized return
+    # Calculate annualized return using ACTUAL trading days
     total_return_r = np.prod(1+r_rets) - 1
-    annualized_return_r = (1 + total_return_r) ** (1 / oos_years_count) - 1
+    num_trading_days_r = len(r_rets)
+    annualized_return_r = (1 + total_return_r) ** (252 / num_trading_days_r) - 1
     
     r1.metric(f"PREDICTION", s['fcasts'][s['runner']], delta=f"Valid: {s['next_day']}")
     r2.metric("Annualized Return (Net)", f"{annualized_return_r:.2%}", delta=f"OOS: {s['oos_years']}")
@@ -478,6 +478,10 @@ if st.session_state.results:
     st.info("""
     **Recency Score (15d):** The 'Hit Rate' of a model over the last 15 trading sessions (% of positive days). 
     The engine blends this (30%) with long-term OOS performance (70%) to rank the models.
+    
+    **Data Split:** 80% Training / 20% Out-of-Sample Testing (no validation set)
+    
+    **Annualized Return:** Calculated using actual trading days: (1 + total_return)^(252/num_days) - 1
     """)
     
     st.subheader("🤖 Model Descriptions")
@@ -513,7 +517,7 @@ if st.session_state.results:
             st.metric("Requested Start", diag['requested_start'])
         with col_b:
             st.metric("Actual Data Start", diag['actual_start'])
-            st.metric("Training/OOS Split", diag['split_date'])
+            st.metric("Training/OOS Split", diag.get('train_test_split', '80/20'))
         with col_c:
             st.metric("Total Data Rows", f"{diag['processed_rows']:,}")
             st.metric("Features Used", f"{diag.get('num_features', 'N/A')}")

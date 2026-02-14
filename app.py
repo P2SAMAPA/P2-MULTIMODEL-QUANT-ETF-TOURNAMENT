@@ -182,9 +182,29 @@ def run_tournament_engine(features_json, returns_json, rf_rate, tcost_bps, start
     raw_end = features_df.index[-1].strftime('%Y-%m-%d')
     raw_rows = len(features_df)
     
+    # CRITICAL: Clean infinities and NaNs BEFORE any processing
+    features_df = features_df.replace([np.inf, -np.inf], np.nan)
+    returns_df = returns_df.replace([np.inf, -np.inf], np.nan)
+    features_df = features_df.ffill().bfill().dropna()
+    returns_df = returns_df.ffill().bfill().dropna()
+    
+    # Align after cleaning
+    common_idx = features_df.index.intersection(returns_df.index)
+    features_df = features_df.loc[common_idx]
+    returns_df = returns_df.loc[common_idx]
+    
+    if len(features_df) < 100:
+        raise ValueError(f"Insufficient data after cleaning: {len(features_df)} rows")
+    
     # Calculate momentum features for different lookback periods
     lookback_periods = [30, 45, 60]
-    momentum_dict = calculate_momentum_features(features_df, lookback_periods)
+    momentum_dict = {}
+    
+    for period in lookback_periods:
+        momentum = features_df.pct_change(period)
+        momentum = momentum.replace([np.inf, -np.inf], np.nan)
+        momentum = momentum.ffill().bfill()
+        momentum_dict[f'momentum_{period}d'] = momentum
     
     # Test each lookback period to find best performing one
     best_lookback = None
@@ -192,7 +212,8 @@ def run_tournament_engine(features_json, returns_json, rf_rate, tcost_bps, start
     
     for period in lookback_periods:
         momentum_data = momentum_dict[f'momentum_{period}d']
-        combined_data = pd.concat([features_df, momentum_data.add_suffix(f'_mom{period}')], axis=1).dropna()
+        combined_data = pd.concat([features_df, momentum_data.add_suffix(f'_mom{period}')], axis=1)
+        combined_data = combined_data.replace([np.inf, -np.inf], np.nan).dropna()
         
         if len(combined_data) < 100:
             continue
@@ -201,7 +222,9 @@ def run_tournament_engine(features_json, returns_json, rf_rate, tcost_bps, start
         aligned_returns = returns_df.loc[combined_data.index]
         mom_cols = [col for col in combined_data.columns if f'_mom{period}' in col]
         if len(aligned_returns) > 0 and len(mom_cols) > 0:
-            score = np.abs(combined_data[mom_cols].corrwith(aligned_returns.iloc[:, 0])).mean()
+            corr = combined_data[mom_cols].corrwith(aligned_returns.iloc[:, 0])
+            corr = corr.replace([np.inf, -np.inf], 0).fillna(0)
+            score = np.abs(corr).mean()
             if score > best_score:
                 best_score = score
                 best_lookback = period
@@ -212,12 +235,22 @@ def run_tournament_engine(features_json, returns_json, rf_rate, tcost_bps, start
     
     # Build final dataset with best lookback
     momentum_data = momentum_dict[f'momentum_{best_lookback}d']
-    features_with_momentum = pd.concat([features_df, momentum_data.add_suffix(f'_mom{best_lookback}')], axis=1).dropna()
+    features_with_momentum = pd.concat([features_df, momentum_data.add_suffix(f'_mom{best_lookback}')], axis=1)
+    features_with_momentum = features_with_momentum.replace([np.inf, -np.inf], np.nan).dropna()
     
     # Align features and returns
     common_idx = features_with_momentum.index.intersection(returns_df.index)
     X = features_with_momentum.loc[common_idx].values
     y = returns_df.loc[common_idx].values
+    
+    # Final check for inf/nan
+    if not np.isfinite(X).all():
+        st.warning("Cleaning remaining non-finite values in features...")
+        X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
+    
+    if not np.isfinite(y).all():
+        st.warning("Cleaning remaining non-finite values in returns...")
+        y = np.nan_to_num(y, nan=0.0, posinf=0.0, neginf=0.0)
     
     # Diagnostics
     after_processing_start = common_idx[0].strftime('%Y-%m-%d')
@@ -347,6 +380,7 @@ def run_tournament_engine(features_json, returns_json, rf_rate, tcost_bps, start
         'best_lookback': best_lookback
     }
 
+    return results, test_dates, forecasts, champ, runner_up, m_table, recency_scores, oos_years, diagnostics
     return results, test_dates, forecasts, champ, runner_up, m_table, recency_scores, oos_years, diagnostics
 
 # --- 5. UI ---

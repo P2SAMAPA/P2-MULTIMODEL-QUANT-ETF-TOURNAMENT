@@ -1,0 +1,40 @@
+name: Sync to Hugging Face
+
+on:
+  push:
+    branches: [main]  # change to 'master' if your default branch is master
+  workflow_dispatch:  # allows manual trigger from GitHub Actions tab
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+          lfs: true  # important if you have files >10MB
+      
+      - name: Push to Hugging Face
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          git remote add space https://P2SAMAPA:$HF_TOKEN@huggingface.co/spaces/P2SAMAPA/P2-ETF-MULTIMODEL-QUANT-TOURNAMENT
+          git push --force space main
+```
+
+---
+
+## **Steps to set this up:**
+
+### 1. **Create the workflow file in your GitHub repo:**
+```
+your-repo/
+├── .github/
+│   └── workflows/
+│       └── sync-to-hf.yml  ← Create this file
+├── app.py
+├── requirements.txt
+├── README.md
+├── Dockerfile
+└── .gitignore

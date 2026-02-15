@@ -74,6 +74,47 @@ def get_next_trading_day():
         pass
     return (pd.Timestamp.now() + timedelta(days=1)).strftime('%Y-%m-%d')
 
+def calculate_hold_period_returns(predictions, returns_df, tcost_bps, hold_periods=[1, 3, 5]):
+    """Calculate annualized returns for different hold periods accounting for transaction costs"""
+    tcost_dec = tcost_bps / 10000
+    hold_returns = {}
+    
+    for hold_days in hold_periods:
+        period_returns = []
+        i = 0
+        while i < len(predictions) - hold_days:
+            etf = predictions[i]
+            # Get the next hold_days returns for this ETF
+            future_rets = returns_df[etf].iloc[i:i+hold_days]
+            total_ret = np.prod(1 + future_rets) - 1
+            # Subtract transaction cost for this trade
+            net_ret = total_ret - tcost_dec
+            period_returns.append(net_ret)
+            i += hold_days  # Skip to next period
+        
+        if period_returns:
+            avg_period_return = np.mean(period_returns)
+            # Calculate annualized return: (1 + avg_return)^(252/hold_days) - 1
+            num_periods_per_year = 252 / hold_days
+            annualized_return = (1 + avg_period_return) ** num_periods_per_year - 1
+            
+            hold_returns[hold_days] = {
+                'avg_return': avg_period_return,
+                'annualized': annualized_return,
+                'num_trades_per_year': num_periods_per_year
+            }
+        else:
+            hold_returns[hold_days] = {
+                'avg_return': 0,
+                'annualized': 0,
+                'num_trades_per_year': 0
+            }
+    
+    # Find optimal hold period (highest annualized return)
+    optimal_period = max(hold_returns.keys(), key=lambda k: hold_returns[k]['annualized'])
+    
+    return hold_returns, optimal_period
+
 def load_data_from_hf(start_year, hf_token, dataset_repo):
     """Load data from HuggingFace dataset"""
     try:
@@ -294,6 +335,7 @@ def run_tournament_engine(features_json, returns_json, rf_rate, tcost_bps, start
         dl_models[name] = model
 
     results = {"PPO": [], "A2C": [], "CNN-LSTM": [], "Transformer": []}
+    predictions = {"PPO": [], "A2C": [], "CNN-LSTM": [], "Transformer": []}
     test_dates = common_idx[split:]
     tcost_dec = tcost_bps / 10000
 
@@ -306,6 +348,7 @@ def run_tournament_engine(features_json, returns_json, rf_rate, tcost_bps, start
             else:
                 act, _ = a2c.predict(X_test_flat[i], deterministic=True)
             
+            predictions[name].append(TARGET_ETFS[act])
             day_ret = y_test_rl[i, act]
             if last_pick is not None and act != last_pick: 
                 day_ret -= tcost_dec
@@ -320,6 +363,7 @@ def run_tournament_engine(features_json, returns_json, rf_rate, tcost_bps, start
                 out = dl_models[name](torch.tensor(X_test[i]).unsqueeze(0).float())
                 act = torch.argmax(out).item()
             
+            predictions[name].append(TARGET_ETFS[act])
             day_ret = y_test[i, act]
             if last_pick is not None and act != last_pick:
                 day_ret -= tcost_dec
@@ -340,10 +384,13 @@ def run_tournament_engine(features_json, returns_json, rf_rate, tcost_bps, start
     sorted_models = sorted(perf.items(), key=lambda x: x[1], reverse=True)
     champ, runner_up = sorted_models[0][0], sorted_models[1][0]
     
-    # Forecasts for both
+    # Forecasts for both with optimal hold period
     forecasts = {}
     latest_feat_flat = X_sc[-1:]
     latest_feat_seq = X_seq[-1:]
+    
+    # Create returns dataframe for hold period calculation (aligned with test dates)
+    oos_returns_df = returns_df.loc[test_dates]
     
     for m in [champ, runner_up]:
         if m == "PPO": 
@@ -354,7 +401,17 @@ def run_tournament_engine(features_json, returns_json, rf_rate, tcost_bps, start
             with torch.no_grad():
                 f_out = dl_models[m](torch.tensor(latest_feat_seq).float())
                 act = torch.argmax(f_out).item()
-        forecasts[m] = TARGET_ETFS[act]
+        
+        etf_pred = TARGET_ETFS[act]
+        
+        # Calculate hold period returns and find optimal
+        hold_stats, optimal_hold = calculate_hold_period_returns(predictions[m], oos_returns_df, tcost_bps, [1, 3, 5])
+        
+        forecasts[m] = {
+            'etf': etf_pred,
+            'hold_periods': hold_stats,
+            'optimal_hold': optimal_hold
+        }
 
     # Process Table (Champion only)
     champ_series = pd.Series(results[champ], index=test_dates)
@@ -438,12 +495,18 @@ if st.session_state.results:
     c1, c2, c3, c4 = st.columns(4)
     c_rets = np.array(s['res'][s['champ']])
     
-    # Calculate annualized return using ACTUAL trading days (proper method for daily returns)
+    # Calculate annualized return using ACTUAL trading days
     total_return_c = np.prod(1+c_rets) - 1
     num_trading_days_c = len(c_rets)
     annualized_return_c = (1 + total_return_c) ** (252 / num_trading_days_c) - 1
     
-    c1.metric(f"PREDICTION", s['fcasts'][s['champ']], delta=f"Valid: {s['next_day']}")
+    # Get optimal hold period and stats
+    optimal_hold_c = s['fcasts'][s['champ']]['optimal_hold']
+    hold_stats_c = s['fcasts'][s['champ']]['hold_periods']
+    
+    c1.metric(f"PREDICTION", 
+              s['fcasts'][s['champ']]['etf'], 
+              delta=f"Hold: {optimal_hold_c}d | Ann. Return: {hold_stats_c[optimal_hold_c]['annualized']:.2%}")
     c2.metric("Annualized Return (Net)", f"{annualized_return_c:.2%}", delta=f"OOS: {s['oos_years']}")
     c3.metric("Sharpe (Annualized)", f"{((np.mean(c_rets)-(s['rf']/252))/np.std(c_rets)*np.sqrt(252)):.2f}", delta=f"SOFR: {s['rf']:.2%}", delta_color="normal")
     c4.metric("Recency Score (15d)", f"{s['recency'][s['champ']]:.0%}")
@@ -458,7 +521,13 @@ if st.session_state.results:
     num_trading_days_r = len(r_rets)
     annualized_return_r = (1 + total_return_r) ** (252 / num_trading_days_r) - 1
     
-    r1.metric(f"PREDICTION", s['fcasts'][s['runner']], delta=f"Valid: {s['next_day']}")
+    # Get optimal hold period and stats
+    optimal_hold_r = s['fcasts'][s['runner']]['optimal_hold']
+    hold_stats_r = s['fcasts'][s['runner']]['hold_periods']
+    
+    r1.metric(f"PREDICTION", 
+              s['fcasts'][s['runner']]['etf'], 
+              delta=f"Hold: {optimal_hold_r}d | Ann. Return: {hold_stats_r[optimal_hold_r]['annualized']:.2%}")
     r2.metric("Annualized Return (Net)", f"{annualized_return_r:.2%}", delta=f"OOS: {s['oos_years']}")
     r3.metric("Sharpe (Annualized)", f"{((np.mean(r_rets)-(s['rf']/252))/np.std(r_rets)*np.sqrt(252)):.2f}", delta=f"SOFR: {s['rf']:.2%}", delta_color="normal")
     r4.metric("Recency Score (15d)", f"{s['recency'][s['runner']]:.0%}")
@@ -482,6 +551,8 @@ if st.session_state.results:
     **Data Split:** 80% Training / 20% Out-of-Sample Testing (no validation set)
     
     **Annualized Return:** Calculated using actual trading days: (1 + total_return)^(252/num_days) - 1
+    
+    **Optimal Hold Period:** Model tests 1-day, 3-day, and 5-day hold periods, calculating annualized returns after transaction costs for each. The period with the highest net annualized return is recommended.
     """)
     
     st.subheader("🤖 Model Descriptions")

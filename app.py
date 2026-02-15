@@ -431,9 +431,7 @@ with st.sidebar:
     
     if period_option == "Option A (Default)":
         ensemble_years = DEFAULT_ENSEMBLE_YEARS
-        st.caption("**Default Periods:**")
-        for year in ensemble_years:
-            st.caption(f"• {year}")
+        st.info(f"**Using Years:** {', '.join(map(str, ensemble_years))}")
     else:
         st.caption("**Select 6 Years:**")
         current_year = datetime.now().year
@@ -496,6 +494,17 @@ if run_btn:
             consensus_etf = champion_votes.most_common(1)[0][0]
             consensus_votes = champion_votes[consensus_etf]
             
+            # Calculate consensus hold period (most common among periods that voted for consensus ETF)
+            consensus_holds = []
+            for r in ensemble_results.values():
+                if r['champion_prediction'] == consensus_etf:
+                    consensus_holds.append(r['champion_hold'])
+            
+            if consensus_holds:
+                consensus_hold = Counter(consensus_holds).most_common(1)[0][0]
+            else:
+                consensus_hold = 1  # Default to 1 day
+            
             if consensus_votes >= 4:
                 confidence = "HIGH"
             elif consensus_votes == 3:
@@ -512,6 +521,7 @@ if run_btn:
             st.session_state.results = {
                 "ensemble_results": ensemble_results,
                 "consensus_etf": consensus_etf,
+                "consensus_hold": consensus_hold,
                 "consensus_votes": consensus_votes,
                 "total_periods": len(ensemble_results),
                 "champion_votes": dict(champion_votes),
@@ -542,14 +552,17 @@ if st.session_state.results:
     
     cons1, cons2, cons3 = st.columns(3)
     
+    # Display ETF with hold period
+    etf_with_hold = f"{s['consensus_etf']} (Hold: {s['consensus_hold']}d)"
+    
     if s['confidence'] == "HIGH":
-        cons1.success(f"**{s['consensus_etf']}**")
+        cons1.success(f"**{etf_with_hold}**")
         cons1.caption(f"Consensus: {s['consensus_votes']}/{s['total_periods']} periods")
     elif s['confidence'] == "MEDIUM":
-        cons1.info(f"**{s['consensus_etf']}**")
+        cons1.info(f"**{etf_with_hold}**")
         cons1.caption(f"Consensus: {s['consensus_votes']}/{s['total_periods']} periods")
     else:
-        cons1.warning(f"**{s['consensus_etf']}**")
+        cons1.warning(f"**{etf_with_hold}**")
         cons1.caption(f"Weak consensus: {s['consensus_votes']}/{s['total_periods']} periods")
     
     cons2.metric("Confidence Level", s['confidence'], 
@@ -629,7 +642,7 @@ if st.session_state.results:
     
     **Trading Recommendation:** Only trade when confidence is HIGH or when internal agreement is strong across multiple periods. This approach significantly reduces the risk of following overfitted predictions from any single training period.
     
-    **Hold Period Optimization:** Each model tests 1-day, 3-day, and 5-day hold periods, selecting the one with the highest annualized return after transaction costs.
+    **Hold Period Optimization:** Each model tests 1-day, 3-day, and 5-day hold periods, selecting the one with the highest annualized return after transaction costs. The consensus hold period is the most common recommendation among periods that voted for the consensus ETF.
     """)
     
     st.subheader("🤖 Model Descriptions")

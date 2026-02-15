@@ -606,12 +606,12 @@ if st.session_state.results:
     col3.metric("Sharpe Ratio", f"{br['sharpe']:.2f}", delta=f"SOFR: {s['rf']:.2%}")
     col4.metric("Recency Score (15d)", f"{br['recency']:.0%}")
     
-    # Performance chart
+    # Performance chart - CHANGED HERE
     st.divider()
     fig = go.Figure()
     for name, r in br['results'].items():
         fig.add_trace(go.Scatter(x=br['test_dates'], y=np.cumprod(1 + np.array(r)), name=name))
-    fig.update_layout(title=f"Net Return Performance - {s['best_period']} Training Period", 
+    fig.update_layout(title=f"Net Return Performance - {br['oos_years']} OOS Period", 
                      template="plotly_dark", height=400)
     st.plotly_chart(fig, use_container_width=True)
     

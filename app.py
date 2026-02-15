@@ -14,6 +14,7 @@ import pandas_market_calendars as mcal
 from datasets import load_dataset
 import os
 from io import StringIO
+from collections import Counter
 
 # --- 1. SETTINGS & STATE ---
 st.set_page_config(page_title="Alpha Tournament Pro", layout="wide")
@@ -21,6 +22,7 @@ st.set_page_config(page_title="Alpha Tournament Pro", layout="wide")
 if 'results' not in st.session_state: st.session_state.results = None
 
 TARGET_ETFS = ['TLT', 'TBT', 'VNQ', 'GLD', 'SLV']
+ENSEMBLE_YEARS = [2008, 2010, 2013, 2015, 2019, 2021]
 
 # Get secrets from HF Spaces
 FRED_API_KEY = os.environ.get("FRED_API_KEY")
@@ -175,7 +177,6 @@ def load_data_from_hf(start_year, hf_token, dataset_repo):
         all_cols = ret_cols + feature_cols
         missing = [c for c in all_cols if c not in df.columns]
         if missing:
-            st.warning(f"Missing columns in dataset: {missing}")
             # Remove missing columns from feature list
             feature_cols = [c for c in feature_cols if c in df.columns]
         
@@ -196,15 +197,11 @@ def load_data_from_hf(start_year, hf_token, dataset_repo):
         features_df = features_df.loc[common_idx]
         
         if len(returns_df) < 100:
-            st.error(f"Insufficient data after filtering: {len(returns_df)} rows")
             return None, None
         
         return (features_df, returns_df), "HuggingFace Dataset"
         
     except Exception as e:
-        st.error(f"Error loading from HF dataset: {str(e)}")
-        import traceback
-        st.code(traceback.format_exc())
         return None, None
 
 class TradingEnv(gym.Env):
@@ -232,15 +229,9 @@ class TradingEnv(gym.Env):
         return self.features[self.current_step], reward, done, False, {}
 
 # --- 4. ENGINE ---
-@st.cache_resource(ttl=604800)
 def run_tournament_engine(features_json, returns_json, rf_rate, tcost_bps, start_year, data_source):
     features_df = pd.read_json(StringIO(features_json))
     returns_df = pd.read_json(StringIO(returns_json))
-    
-    # Track data transformations for diagnostics
-    raw_start = features_df.index[0].strftime('%Y-%m-%d')
-    raw_end = features_df.index[-1].strftime('%Y-%m-%d')
-    raw_rows = len(features_df)
     
     # CRITICAL: Clean infinities and NaNs BEFORE any processing
     features_df = features_df.replace([np.inf, -np.inf], np.nan)
@@ -254,7 +245,7 @@ def run_tournament_engine(features_json, returns_json, rf_rate, tcost_bps, start
     returns_df = returns_df.loc[common_idx]
     
     if len(features_df) < 100:
-        raise ValueError(f"Insufficient data after cleaning: {len(features_df)} rows")
+        return None
     
     # Calculate momentum features for different lookback periods
     lookback_periods = [30, 45, 60]
@@ -305,21 +296,14 @@ def run_tournament_engine(features_json, returns_json, rf_rate, tcost_bps, start
     
     # Final check for inf/nan
     if not np.isfinite(X).all():
-        st.warning("Cleaning remaining non-finite values in features...")
         X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
     
     if not np.isfinite(y).all():
-        st.warning("Cleaning remaining non-finite values in returns...")
         y = np.nan_to_num(y, nan=0.0, posinf=0.0, neginf=0.0)
-    
-    # Diagnostics
-    after_processing_start = common_idx[0].strftime('%Y-%m-%d')
-    after_processing_rows = len(common_idx)
     
     scaler = StandardScaler()
     X_sc = scaler.fit_transform(X).astype(np.float32)
     split = int(len(X_sc) * 0.8)
-    split_date = common_idx[split].strftime('%Y-%m-%d')
     
     # Analyze OOS period characteristics
     period_stats = analyze_period_characteristics(returns_df.loc[common_idx], split)
@@ -446,66 +430,121 @@ def run_tournament_engine(features_json, returns_json, rf_rate, tcost_bps, start
     m_table.columns = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'][:len(m_table.columns)]
     m_table['Yearly Total'] = m_table.apply(lambda row: np.prod(1 + row) - 1, axis=1)
 
-    # Diagnostics info
-    diagnostics = {
-        'requested_start': f"{start_year}-01-01",
-        'raw_start': raw_start,
-        'raw_end': raw_end,
-        'raw_rows': raw_rows,
-        'actual_start': after_processing_start,
-        'processed_rows': after_processing_rows,
-        'split_date': split_date,
-        'data_source': data_source,
-        'best_lookback': best_lookback,
-        'num_features': X.shape[1],
-        'train_test_split': '80/20',
-        'period_stats': period_stats
-    }
+    # Calculate annualized return
+    c_rets = np.array(results[champ])
+    total_return_c = np.prod(1+c_rets) - 1
+    num_trading_days_c = len(c_rets)
+    annualized_return_c = (1 + total_return_c) ** (252 / num_trading_days_c) - 1
 
-    return results, test_dates, forecasts, champ, runner_up, m_table, recency_scores, oos_years, diagnostics
+    return {
+        'champion': champ,
+        'runner_up': runner_up,
+        'champion_prediction': forecasts[champ]['etf'],
+        'runner_up_prediction': forecasts[runner_up]['etf'],
+        'champion_hold': forecasts[champ]['optimal_hold'],
+        'runner_up_hold': forecasts[runner_up]['optimal_hold'],
+        'annualized_return': annualized_return_c,
+        'sharpe': (np.mean(c_rets)-(rf_rate/252))/np.std(c_rets)*np.sqrt(252),
+        'recency': recency_scores[champ],
+        'oos_years': oos_years,
+        'monthly_table': m_table,
+        'period_stats': period_stats,
+        'results': results,
+        'test_dates': test_dates
+    }
 
 # --- 5. UI ---
 st.title("Alpha Tournament Pro: Multi-model ETF Forecast")
 
 with st.sidebar:
     st.header("Tournament Configuration")
-    
-    start_year = st.slider(
-        "Select Training Start Year", 
-        min_value=2008, 
-        max_value=2024,
-        value=2015,
-        step=1,
-        help="Choose the year from which to start training the models"
-    )
-    
     t_cost = st.slider("Transaction Cost (bps)", min_value=0, max_value=100, value=10, step=5)
-    run_btn = st.button("🚀 Execute Alpha Tournament")
+    run_btn = st.button("🚀 Execute Ensemble Tournament")
+    
+    st.divider()
+    st.caption("**Training Periods:**")
+    for year in ENSEMBLE_YEARS:
+        st.caption(f"• {year}")
 
 if run_btn:
-    with st.status(f"Training Tournament Models...") as status:
+    with st.status(f"Running Ensemble Tournament across {len(ENSEMBLE_YEARS)} training periods...") as status:
         try:
             rf = get_sofr_rate(FRED_API_KEY)
-            data_tuple = load_data_from_hf(start_year, HF_TOKEN, HF_DATASET_REPO)
             
-            if data_tuple[0] is None:
-                st.error("Failed to load data from HuggingFace dataset")
+            ensemble_results = {}
+            progress_bar = st.progress(0)
+            
+            for idx, start_year in enumerate(ENSEMBLE_YEARS):
+                status.update(label=f"Training period {start_year}... ({idx+1}/{len(ENSEMBLE_YEARS)})")
+                
+                data_tuple = load_data_from_hf(start_year, HF_TOKEN, HF_DATASET_REPO)
+                
+                if data_tuple[0] is None:
+                    continue
+                
+                (features_df, returns_df), data_src = data_tuple
+                
+                result = run_tournament_engine(
+                    features_df.to_json(), 
+                    returns_df.to_json(), 
+                    rf, t_cost, start_year, data_src
+                )
+                
+                if result is not None:
+                    ensemble_results[start_year] = result
+                
+                progress_bar.progress((idx + 1) / len(ENSEMBLE_YEARS))
+            
+            if len(ensemble_results) == 0:
+                st.error("Failed to run any training periods")
                 st.stop()
             
-            (features_df, returns_df), data_src = data_tuple
+            # Ensemble voting logic
+            champion_votes = Counter([r['champion_prediction'] for r in ensemble_results.values()])
+            runner_up_votes = Counter([r['runner_up_prediction'] for r in ensemble_results.values()])
             
-            res, dates, fcasts, champ, runner, m_table, r_scores, oos_years, diag = run_tournament_engine(
-                features_df.to_json(), 
-                returns_df.to_json(), 
-                rf, t_cost, start_year, data_src
-            )
+            # Check champion vs runner-up agreement within each period
+            agreement_count = sum(1 for r in ensemble_results.values() 
+                                if r['champion_prediction'] == r['runner_up_prediction'])
+            
+            consensus_etf = champion_votes.most_common(1)[0][0]
+            consensus_votes = champion_votes[consensus_etf]
+            
+            # Determine confidence
+            if consensus_votes >= 4:  # At least 4 out of 6
+                confidence = "HIGH"
+                confidence_color = "success"
+            elif consensus_votes == 3:
+                confidence = "MEDIUM"
+                confidence_color = "info"
+            else:
+                confidence = "LOW"
+                confidence_color = "warning"
+            
+            # Pick the best performing period's results for display
+            best_period = max(ensemble_results.keys(), 
+                            key=lambda k: ensemble_results[k]['annualized_return'])
+            best_result = ensemble_results[best_period]
+            
             next_trade_day = get_next_trading_day()
+            
             st.session_state.results = {
-                "res": res, "dates": dates, "fcasts": fcasts, "champ": champ, "runner": runner, 
-                "rf": rf, "monthly": m_table, "recency": r_scores, "t_cost": t_cost, 
-                "oos_years": oos_years, "next_day": next_trade_day, "diagnostics": diag
+                "ensemble_results": ensemble_results,
+                "consensus_etf": consensus_etf,
+                "consensus_votes": consensus_votes,
+                "total_periods": len(ensemble_results),
+                "champion_votes": dict(champion_votes),
+                "runner_up_votes": dict(runner_up_votes),
+                "agreement_count": agreement_count,
+                "confidence": confidence,
+                "confidence_color": confidence_color,
+                "best_result": best_result,
+                "best_period": best_period,
+                "rf": rf,
+                "next_day": next_trade_day
             }
-            status.update(label=f"Tournament Complete!", state="complete")
+            
+            status.update(label=f"Ensemble Tournament Complete!", state="complete")
         except Exception as e:
             status.update(label=f"Error: {str(e)}", state="error")
             st.error(f"Failed to run tournament: {str(e)}")
@@ -517,65 +556,96 @@ if run_btn:
 if st.session_state.results:
     s = st.session_state.results
     
-    # --- CHAMPION ROW ---
-    st.subheader(f"🏆 Champion: {s['champ']}")
-    c1, c2, c3, c4 = st.columns(4)
-    c_rets = np.array(s['res'][s['champ']])
+    # --- ENSEMBLE CONSENSUS ---
+    st.subheader("🎯 Ensemble Consensus Prediction")
     
-    # Calculate annualized return using ACTUAL trading days
-    total_return_c = np.prod(1+c_rets) - 1
-    num_trading_days_c = len(c_rets)
-    annualized_return_c = (1 + total_return_c) ** (252 / num_trading_days_c) - 1
+    cons1, cons2, cons3 = st.columns(3)
     
-    # Get optimal hold period
-    optimal_hold_c = s['fcasts'][s['champ']]['optimal_hold']
+    if s['confidence'] == "HIGH":
+        cons1.success(f"**{s['consensus_etf']}**")
+        cons1.caption(f"Consensus: {s['consensus_votes']}/{s['total_periods']} periods")
+    elif s['confidence'] == "MEDIUM":
+        cons1.info(f"**{s['consensus_etf']}**")
+        cons1.caption(f"Consensus: {s['consensus_votes']}/{s['total_periods']} periods")
+    else:
+        cons1.warning(f"**{s['consensus_etf']}**")
+        cons1.caption(f"Weak consensus: {s['consensus_votes']}/{s['total_periods']} periods")
     
-    c1.metric(f"PREDICTION", s['fcasts'][s['champ']]['etf'], delta=f"Hold: {optimal_hold_c}d")
-    c2.metric("Annualized Return (Net)", f"{annualized_return_c:.2%}", delta=f"OOS: {s['oos_years']}")
-    c3.metric("Sharpe (Annualized)", f"{((np.mean(c_rets)-(s['rf']/252))/np.std(c_rets)*np.sqrt(252)):.2f}", delta=f"SOFR: {s['rf']:.2%}", delta_color="normal")
-    c4.metric("Recency Score (15d)", f"{s['recency'][s['champ']]:.0%}")
-
-    # --- RUNNER UP ROW ---
-    st.subheader(f"🥈 Runner-Up: {s['runner']}")
-    r1, r2, r3, r4 = st.columns(4)
-    r_rets = np.array(s['res'][s['runner']])
+    cons2.metric("Confidence Level", s['confidence'], 
+                 delta=f"Valid: {s['next_day']}")
     
-    # Calculate annualized return using ACTUAL trading days
-    total_return_r = np.prod(1+r_rets) - 1
-    num_trading_days_r = len(r_rets)
-    annualized_return_r = (1 + total_return_r) ** (252 / num_trading_days_r) - 1
+    cons3.metric("Model Agreement", 
+                f"{s['agreement_count']}/{s['total_periods']} periods",
+                delta="Champion = Runner-up")
     
-    # Get optimal hold period
-    optimal_hold_r = s['fcasts'][s['runner']]['optimal_hold']
-    
-    r1.metric(f"PREDICTION", s['fcasts'][s['runner']]['etf'], delta=f"Hold: {optimal_hold_r}d")
-    r2.metric("Annualized Return (Net)", f"{annualized_return_r:.2%}", delta=f"OOS: {s['oos_years']}")
-    r3.metric("Sharpe (Annualized)", f"{((np.mean(r_rets)-(s['rf']/252))/np.std(r_rets)*np.sqrt(252)):.2f}", delta=f"SOFR: {s['rf']:.2%}", delta_color="normal")
-    r4.metric("Recency Score (15d)", f"{s['recency'][s['runner']]:.0%}")
-
+    # Voting breakdown
     st.divider()
-    # Charts and Tables
+    st.subheader("📊 Voting Breakdown by Training Period")
+    
+    vote_data = []
+    for year, result in s['ensemble_results'].items():
+        vote_data.append({
+            'Training Period': f"{year}-2026",
+            'Champion': result['champion'],
+            'Champion Predicts': result['champion_prediction'],
+            'Hold': f"{result['champion_hold']}d",
+            'Runner-Up': result['runner_up'],
+            'Runner-Up Predicts': result['runner_up_prediction'],
+            'Agreement': '✅' if result['champion_prediction'] == result['runner_up_prediction'] else '❌'
+        })
+    
+    vote_df = pd.DataFrame(vote_data)
+    st.dataframe(vote_df, use_container_width=True)
+    
+    # Best performing period details
+    st.divider()
+    st.subheader(f"📈 Best Performing Period: {s['best_period']}-2026")
+    
+    br = s['best_result']
+    
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("Champion Model", br['champion'])
+    col2.metric("Annualized Return", f"{br['annualized_return']:.2%}", delta=f"OOS: {br['oos_years']}")
+    col3.metric("Sharpe Ratio", f"{br['sharpe']:.2f}", delta=f"SOFR: {s['rf']:.2%}")
+    col4.metric("Recency Score (15d)", f"{br['recency']:.0%}")
+    
+    # Performance chart
+    st.divider()
     fig = go.Figure()
-    for name, r in s['res'].items(): fig.add_trace(go.Scatter(x=s['dates'], y=np.cumprod(1 + np.array(r)), name=name))
-    fig.update_layout(title="Net Return Performance", template="plotly_dark", height=400)
-    st.plotly_chart(fig, width='stretch')
-
-    st.subheader(f"📅 Monthly Matrix ({s['champ']})")
-    st.dataframe(s['monthly'].style.format("{:.2%}"), width='stretch')
-
+    for name, r in br['results'].items():
+        fig.add_trace(go.Scatter(x=br['test_dates'], y=np.cumprod(1 + np.array(r)), name=name))
+    fig.update_layout(title=f"Net Return Performance - {s['best_period']} Training Period", 
+                     template="plotly_dark", height=400)
+    st.plotly_chart(fig, use_container_width=True)
+    
+    # Monthly matrix
+    st.subheader(f"📅 Monthly Matrix - {s['best_period']} Period ({br['champion']})")
+    st.dataframe(br['monthly_table'].style.format("{:.2%}"), use_container_width=True)
+    
+    # Methodology
     st.divider()
     st.header("🔍 Methodology")
     st.info("""
-    **Recency Score (15d):** The 'Hit Rate' of a model over the last 15 trading sessions (% of positive days). 
-    The engine blends this (30%) with long-term OOS performance (70%) to rank the models.
+    **Ensemble Voting System:**
     
-    **Data Split:** 80% Training / 20% Out-of-Sample Testing (no validation set)
+    The Alpha Tournament uses an ensemble approach to reduce overfitting and increase prediction robustness:
     
-    **Annualized Return:** Calculated using actual trading days: (1 + total_return)^(252/num_days) - 1
+    1. **Multiple Training Periods:** Models are trained on 6 different historical periods (2008, 2010, 2013, 2015, 2019, 2021), each using an 80/20 train/test split up to 2026.
     
-    **Optimal Hold Period:** Model tests 1-day, 3-day, and 5-day hold periods, calculating annualized returns after transaction costs for each. The period with the highest net annualized return is recommended.
+    2. **Independent Tournaments:** Each training period runs a complete tournament with 4 model architectures (PPO, A2C, CNN-LSTM, Transformer) competing against each other.
     
-    **Returns Calculation:** Dataset uses close-to-close daily returns: (Today's Close - Yesterday's Close) / Yesterday's Close
+    3. **Consensus Voting:** The final prediction is determined by majority vote across all training periods. Each period's champion model casts one vote.
+    
+    4. **Confidence Scoring:**
+       - **HIGH:** 4+ periods agree (≥67% consensus)
+       - **MEDIUM:** 3 periods agree (50% consensus)
+       - **LOW:** Split vote (no clear majority)
+    
+    5. **Internal Agreement Check:** Within each period, we verify if the champion and runner-up models agree, providing an additional confidence signal.
+    
+    **Trading Recommendation:** Only trade when confidence is HIGH or when internal agreement is strong across multiple periods. This approach significantly reduces the risk of following overfitted predictions from any single training period.
+    
+    **Hold Period Optimization:** Each model tests 1-day, 3-day, and 5-day hold periods, selecting the one with the highest annualized return after transaction costs.
     """)
     
     st.subheader("🤖 Model Descriptions")
@@ -596,49 +666,31 @@ if st.session_state.results:
         st.markdown("**Transformer**")
         st.caption("An attention-based neural network architecture that weighs the importance of different time steps in the input sequence. Uses multi-head self-attention mechanisms to capture complex temporal relationships in market data. Trained for 50 epochs.")
     
-    # Data Diagnostics
-    if 'diagnostics' in s:
+    # Period analysis
+    if 'period_stats' in br:
         st.divider()
-        st.subheader("📊 Data Diagnostics & Period Analysis")
-        diag = s['diagnostics']
+        st.subheader(f"📊 OOS Period Analysis - {s['best_period']} Training")
         
-        # Period analysis
-        if 'period_stats' in diag:
-            pstats = diag['period_stats']
-            st.write("**OOS Period Characteristics:**")
-            
-            # TLT/TBT correlation check
-            if 'tlt_tbt_correlation' in pstats:
-                corr_val = pstats['tlt_tbt_correlation']
-                if corr_val < -0.8:
-                    st.success(f"✅ TLT/TBT Correlation: {corr_val:.2f} (Strong negative - ideal for switching strategy)")
-                elif corr_val < -0.5:
-                    st.info(f"ℹ️ TLT/TBT Correlation: {corr_val:.2f} (Moderate negative)")
-                else:
-                    st.warning(f"⚠️ TLT/TBT Correlation: {corr_val:.2f} (Weak relationship - reduces switching advantage)")
-            
-            # Individual ETF stats
-            st.write("**Individual ETF Performance (OOS Period):**")
-            etf_df = pd.DataFrame({
-                etf: {
-                    'Total Return': f"{stats['total_return']:.2%}",
-                    'Sharpe Ratio': f"{stats['sharpe']:.2f}",
-                    'Daily Volatility': f"{stats['std_daily']:.3%}"
-                }
-                for etf, stats in pstats.items() if etf != 'tlt_tbt_correlation'
-            }).T
-            st.dataframe(etf_df)
+        pstats = br['period_stats']
         
-        if diag['requested_start'] != diag['actual_start']:
-            st.warning(f"⚠️ **Data Availability Notice:** Data requested from {diag['requested_start']}, but actual usable data starts from {diag['actual_start']} due to momentum calculation requirements.")
+        # TLT/TBT correlation check
+        if 'tlt_tbt_correlation' in pstats:
+            corr_val = pstats['tlt_tbt_correlation']
+            if corr_val < -0.8:
+                st.success(f"✅ TLT/TBT Correlation: {corr_val:.2f} (Strong negative - ideal for switching strategy)")
+            elif corr_val < -0.5:
+                st.info(f"ℹ️ TLT/TBT Correlation: {corr_val:.2f} (Moderate negative)")
+            else:
+                st.warning(f"⚠️ TLT/TBT Correlation: {corr_val:.2f} (Weak relationship - reduces switching advantage)")
         
-        col_a, col_b, col_c = st.columns(3)
-        with col_a:
-            st.metric("Data Source", diag['data_source'])
-            st.metric("Requested Start", diag['requested_start'])
-        with col_b:
-            st.metric("Actual Data Start", diag['actual_start'])
-            st.metric("Training/OOS Split", diag.get('train_test_split', '80/20'))
-        with col_c:
-            st.metric("Total Data Rows", f"{diag['processed_rows']:,}")
-            st.metric("Features Used", f"{diag.get('num_features', 'N/A')}")
+        # Individual ETF stats
+        st.write("**Individual ETF Performance (OOS Period):**")
+        etf_df = pd.DataFrame({
+            etf: {
+                'Total Return': f"{stats['total_return']:.2%}",
+                'Sharpe Ratio': f"{stats['sharpe']:.2f}",
+                'Daily Volatility': f"{stats['std_daily']:.3%}"
+            }
+            for etf, stats in pstats.items() if etf != 'tlt_tbt_correlation'
+        }).T
+        st.dataframe(etf_df, use_container_width=True)

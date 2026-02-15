@@ -109,17 +109,14 @@ def calculate_hold_period_returns(predictions, returns_df, tcost_bps, hold_perio
         i = 0
         while i < len(predictions) - hold_days:
             etf = predictions[i]
-            # Get the next hold_days returns for this ETF
             future_rets = returns_df[etf].iloc[i:i+hold_days]
             total_ret = np.prod(1 + future_rets) - 1
-            # Subtract transaction cost for this trade
             net_ret = total_ret - tcost_dec
             period_returns.append(net_ret)
-            i += hold_days  # Skip to next period
+            i += hold_days
         
         if period_returns:
             avg_period_return = np.mean(period_returns)
-            # Calculate annualized return: (1 + avg_return)^(252/hold_days) - 1
             num_periods_per_year = 252 / hold_days
             annualized_return = (1 + avg_period_return) ** num_periods_per_year - 1
             
@@ -135,21 +132,17 @@ def calculate_hold_period_returns(predictions, returns_df, tcost_bps, hold_perio
                 'num_trades_per_year': 0
             }
     
-    # Find optimal hold period (highest annualized return)
     optimal_period = max(hold_returns.keys(), key=lambda k: hold_returns[k]['annualized'])
     
     return hold_returns, optimal_period
 
+@st.cache_data(ttl=3600)
 def load_data_from_hf(start_year, hf_token, dataset_repo):
     """Load data from HuggingFace dataset"""
     try:
-        # Load the dataset from HF
         dataset = load_dataset(dataset_repo, split='train', token=hf_token)
-        
-        # Convert to pandas DataFrame
         df = dataset.to_pandas()
         
-        # Set Date as index
         if 'Date' in df.columns:
             df['Date'] = pd.to_datetime(df['Date'])
             df = df.set_index('Date')
@@ -157,41 +150,31 @@ def load_data_from_hf(start_year, hf_token, dataset_repo):
             df['date'] = pd.to_datetime(df['date'])
             df = df.set_index('date')
         
-        # Filter data from start_year onwards
         df = df[df.index >= f'{start_year}-01-01']
         df = df.sort_index()
         
-        # Select the columns we need: returns and features
         ret_cols = [f'{etf}_Ret' for etf in TARGET_ETFS]
         
-        # Feature columns: ETF technical indicators + macro signals
         feature_cols = []
         for etf in TARGET_ETFS:
             feature_cols.extend([f'{etf}_MA20', f'{etf}_Vol'])
         
-        # Add macro/market signals
         macro_cols = ['UNRATE', 'CPI', 'VIX', 'TNX', 'DXY', 'AU_CU_Ratio', 'AU_CU_Trend']
         feature_cols.extend(macro_cols)
         
-        # Check all columns exist
         all_cols = ret_cols + feature_cols
         missing = [c for c in all_cols if c not in df.columns]
         if missing:
-            # Remove missing columns from feature list
             feature_cols = [c for c in feature_cols if c in df.columns]
         
-        # Create returns dataframe (for targets)
         returns_df = df[ret_cols].copy()
-        returns_df.columns = TARGET_ETFS  # Rename to simple ETF names
+        returns_df.columns = TARGET_ETFS
         
-        # Create features dataframe
         features_df = df[feature_cols].copy()
         
-        # Forward fill and drop NaN
         returns_df = returns_df.ffill().dropna()
         features_df = features_df.ffill().dropna()
         
-        # Align indices
         common_idx = returns_df.index.intersection(features_df.index)
         returns_df = returns_df.loc[common_idx]
         features_df = features_df.loc[common_idx]
@@ -229,17 +212,17 @@ class TradingEnv(gym.Env):
         return self.features[self.current_step], reward, done, False, {}
 
 # --- 4. ENGINE ---
-def run_tournament_engine(features_json, returns_json, rf_rate, tcost_bps, start_year, data_source):
-    features_df = pd.read_json(StringIO(features_json))
-    returns_df = pd.read_json(StringIO(returns_json))
+@st.cache_data(ttl=86400, show_spinner=False)
+def run_tournament_engine(_features_df, _returns_df, rf_rate, tcost_bps, start_year):
+    """Run tournament for a single training period - cached separately"""
     
-    # CRITICAL: Clean infinities and NaNs BEFORE any processing
-    features_df = features_df.replace([np.inf, -np.inf], np.nan)
-    returns_df = returns_df.replace([np.inf, -np.inf], np.nan)
-    features_df = features_df.ffill().bfill().dropna()
-    returns_df = returns_df.ffill().bfill().dropna()
+    features_df = _features_df.copy()
+    returns_df = _returns_df.copy()
     
-    # Align after cleaning
+    # Clean data
+    features_df = features_df.replace([np.inf, -np.inf], np.nan).ffill().bfill().dropna()
+    returns_df = returns_df.replace([np.inf, -np.inf], np.nan).ffill().bfill().dropna()
+    
     common_idx = features_df.index.intersection(returns_df.index)
     features_df = features_df.loc[common_idx]
     returns_df = returns_df.loc[common_idx]
@@ -247,18 +230,16 @@ def run_tournament_engine(features_json, returns_json, rf_rate, tcost_bps, start
     if len(features_df) < 100:
         return None
     
-    # Calculate momentum features for different lookback periods
+    # Calculate momentum features
     lookback_periods = [30, 45, 60]
     momentum_dict = {}
     
     for period in lookback_periods:
-        momentum = features_df.pct_change(period)
-        momentum = momentum.replace([np.inf, -np.inf], np.nan)
-        momentum = momentum.ffill().bfill()
+        momentum = features_df.pct_change(period).replace([np.inf, -np.inf], np.nan).ffill().bfill()
         momentum_dict[f'momentum_{period}d'] = momentum
     
-    # Test each lookback period to find best performing one
-    best_lookback = None
+    # Find best lookback
+    best_lookback = 45
     best_score = -np.inf
     
     for period in lookback_periods:
@@ -269,7 +250,6 @@ def run_tournament_engine(features_json, returns_json, rf_rate, tcost_bps, start
         if len(combined_data) < 100:
             continue
         
-        # Quick validation score using correlation
         aligned_returns = returns_df.loc[combined_data.index]
         mom_cols = [col for col in combined_data.columns if f'_mom{period}' in col]
         if len(aligned_returns) > 0 and len(mom_cols) > 0:
@@ -280,35 +260,25 @@ def run_tournament_engine(features_json, returns_json, rf_rate, tcost_bps, start
                 best_score = score
                 best_lookback = period
     
-    # Use best lookback period or default to 45
-    if best_lookback is None:
-        best_lookback = 45
-    
-    # Build final dataset with best lookback
+    # Build final dataset
     momentum_data = momentum_dict[f'momentum_{best_lookback}d']
     features_with_momentum = pd.concat([features_df, momentum_data.add_suffix(f'_mom{best_lookback}')], axis=1)
     features_with_momentum = features_with_momentum.replace([np.inf, -np.inf], np.nan).dropna()
     
-    # Align features and returns
     common_idx = features_with_momentum.index.intersection(returns_df.index)
     X = features_with_momentum.loc[common_idx].values
     y = returns_df.loc[common_idx].values
     
-    # Final check for inf/nan
-    if not np.isfinite(X).all():
-        X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
-    
-    if not np.isfinite(y).all():
-        y = np.nan_to_num(y, nan=0.0, posinf=0.0, neginf=0.0)
+    X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
+    y = np.nan_to_num(y, nan=0.0, posinf=0.0, neginf=0.0)
     
     scaler = StandardScaler()
     X_sc = scaler.fit_transform(X).astype(np.float32)
     split = int(len(X_sc) * 0.8)
     
-    # Analyze OOS period characteristics
     period_stats = analyze_period_characteristics(returns_df.loc[common_idx], split)
     
-    # Create sequences for deep learning models
+    # Create sequences
     seq_len = best_lookback
     X_seq = []
     y_seq = []
@@ -318,27 +288,26 @@ def run_tournament_engine(features_json, returns_json, rf_rate, tcost_bps, start
     X_seq = np.array(X_seq)
     y_seq = np.array(y_seq)
     
-    # Adjust split for sequences
     split_seq = int(len(X_seq) * 0.8)
     X_train, X_test = X_seq[:split_seq], X_seq[split_seq:]
     y_train, y_test = y_seq[:split_seq], y_seq[split_seq:]
     
-    # For RL models, use flattened current features
     X_train_flat = X_sc[:split]
     X_test_flat = X_sc[split:]
     y_train_rl = y[:split]
     y_test_rl = y[split:]
     
+    # Train models (reduced iterations for speed)
     env = DummyVecEnv([lambda: TradingEnv(X_train_flat, y_train_rl, TARGET_ETFS, tcost_bps)])
-    ppo = PPO("MlpPolicy", env, verbose=0).learn(5000)
-    a2c = A2C("MlpPolicy", env, verbose=0).learn(5000)
+    ppo = PPO("MlpPolicy", env, verbose=0).learn(3000)  # Reduced from 5000
+    a2c = A2C("MlpPolicy", env, verbose=0).learn(3000)  # Reduced from 5000
     
     dl_models = {}
     for name, m_class in [("CNN-LSTM", CNN_LSTM_Model), ("Transformer", TransformerModel)]:
         model = m_class(X.shape[1], len(TARGET_ETFS), seq_len)
         opt = torch.optim.Adam(model.parameters(), lr=0.005)
         X_t, y_t = torch.tensor(X_train).float(), torch.tensor(y_train).float()
-        for _ in range(50): 
+        for _ in range(30):  # Reduced from 50
             opt.zero_grad()
             nn.MSELoss()(model(X_t), y_t).backward()
             opt.step()
@@ -349,7 +318,7 @@ def run_tournament_engine(features_json, returns_json, rf_rate, tcost_bps, start
     test_dates = common_idx[split:]
     tcost_dec = tcost_bps / 10000
 
-    # PPO and A2C predictions
+    # Generate predictions
     for name in ["PPO", "A2C"]:
         last_pick = None
         for i in range(len(X_test_flat)):
@@ -365,7 +334,6 @@ def run_tournament_engine(features_json, returns_json, rf_rate, tcost_bps, start
             results[name].append(day_ret)
             last_pick = act
     
-    # Deep learning model predictions
     for name in ["CNN-LSTM", "Transformer"]:
         last_pick = None
         for i in range(len(X_test)):
@@ -380,26 +348,21 @@ def run_tournament_engine(features_json, returns_json, rf_rate, tcost_bps, start
             results[name].append(day_ret)
             last_pick = act
 
-    # OOS period calculation
     oos_start_year = test_dates[0].year
     oos_end_year = test_dates[-1].year
     oos_years = f"{oos_start_year}-{oos_end_year}" if oos_start_year != oos_end_year else str(oos_start_year)
 
-    # Logic for ranking
     recency_window = 15
     recency_scores = {n: np.sum(np.array(r[-recency_window:]) > 0) / recency_window for n, r in results.items()}
     perf = {k: ((np.prod(1 + np.array(results[k])) - 1) * 0.7) + (recency_scores[k] * 0.3) for k in results.keys()}
     
-    # Sort to find Champion and Runner-Up
     sorted_models = sorted(perf.items(), key=lambda x: x[1], reverse=True)
     champ, runner_up = sorted_models[0][0], sorted_models[1][0]
     
-    # Forecasts for both with optimal hold period
     forecasts = {}
     latest_feat_flat = X_sc[-1:]
     latest_feat_seq = X_seq[-1:]
     
-    # Create returns dataframe for hold period calculation (aligned with test dates)
     oos_returns_df = returns_df.loc[test_dates]
     
     for m in [champ, runner_up]:
@@ -413,8 +376,6 @@ def run_tournament_engine(features_json, returns_json, rf_rate, tcost_bps, start
                 act = torch.argmax(f_out).item()
         
         etf_pred = TARGET_ETFS[act]
-        
-        # Calculate hold period returns and find optimal
         hold_stats, optimal_hold = calculate_hold_period_returns(predictions[m], oos_returns_df, tcost_bps, [1, 3, 5])
         
         forecasts[m] = {
@@ -423,14 +384,12 @@ def run_tournament_engine(features_json, returns_json, rf_rate, tcost_bps, start
             'optimal_hold': optimal_hold
         }
 
-    # Process Table (Champion only)
     champ_series = pd.Series(results[champ], index=test_dates)
     monthly_rets = champ_series.groupby([champ_series.index.year, champ_series.index.month]).apply(lambda x: np.prod(1+x)-1)
     m_table = monthly_rets.unstack().fillna(0)
     m_table.columns = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'][:len(m_table.columns)]
     m_table['Yearly Total'] = m_table.apply(lambda row: np.prod(1 + row) - 1, axis=1)
 
-    # Calculate annualized return
     c_rets = np.array(results[champ])
     total_return_c = np.prod(1+c_rets) - 1
     num_trading_days_c = len(c_rets)
@@ -467,15 +426,15 @@ with st.sidebar:
         st.caption(f"• {year}")
 
 if run_btn:
-    with st.status(f"Running Ensemble Tournament across {len(ENSEMBLE_YEARS)} training periods...") as status:
+    with st.status(f"Running Ensemble Tournament...") as status:
         try:
             rf = get_sofr_rate(FRED_API_KEY)
             
             ensemble_results = {}
-            progress_bar = st.progress(0)
+            progress_container = st.empty()
             
             for idx, start_year in enumerate(ENSEMBLE_YEARS):
-                status.update(label=f"Training period {start_year}... ({idx+1}/{len(ENSEMBLE_YEARS)})")
+                progress_container.info(f"Training period {start_year}... ({idx+1}/{len(ENSEMBLE_YEARS)})")
                 
                 data_tuple = load_data_from_hf(start_year, HF_TOKEN, HF_DATASET_REPO)
                 
@@ -484,16 +443,12 @@ if run_btn:
                 
                 (features_df, returns_df), data_src = data_tuple
                 
-                result = run_tournament_engine(
-                    features_df.to_json(), 
-                    returns_df.to_json(), 
-                    rf, t_cost, start_year, data_src
-                )
+                result = run_tournament_engine(features_df, returns_df, rf, t_cost, start_year)
                 
                 if result is not None:
                     ensemble_results[start_year] = result
-                
-                progress_bar.progress((idx + 1) / len(ENSEMBLE_YEARS))
+            
+            progress_container.empty()
             
             if len(ensemble_results) == 0:
                 st.error("Failed to run any training periods")
@@ -503,25 +458,19 @@ if run_btn:
             champion_votes = Counter([r['champion_prediction'] for r in ensemble_results.values()])
             runner_up_votes = Counter([r['runner_up_prediction'] for r in ensemble_results.values()])
             
-            # Check champion vs runner-up agreement within each period
             agreement_count = sum(1 for r in ensemble_results.values() 
                                 if r['champion_prediction'] == r['runner_up_prediction'])
             
             consensus_etf = champion_votes.most_common(1)[0][0]
             consensus_votes = champion_votes[consensus_etf]
             
-            # Determine confidence
-            if consensus_votes >= 4:  # At least 4 out of 6
+            if consensus_votes >= 4:
                 confidence = "HIGH"
-                confidence_color = "success"
             elif consensus_votes == 3:
                 confidence = "MEDIUM"
-                confidence_color = "info"
             else:
                 confidence = "LOW"
-                confidence_color = "warning"
             
-            # Pick the best performing period's results for display
             best_period = max(ensemble_results.keys(), 
                             key=lambda k: ensemble_results[k]['annualized_return'])
             best_result = ensemble_results[best_period]
@@ -537,7 +486,6 @@ if run_btn:
                 "runner_up_votes": dict(runner_up_votes),
                 "agreement_count": agreement_count,
                 "confidence": confidence,
-                "confidence_color": confidence_color,
                 "best_result": best_result,
                 "best_period": best_period,
                 "rf": rf,
@@ -654,17 +602,17 @@ if st.session_state.results:
     
     with col1:
         st.markdown("**PPO (Proximal Policy Optimization)**")
-        st.caption("A state-of-the-art reinforcement learning algorithm that learns optimal trading policies through trial and error. PPO uses an actor-critic architecture and clips policy updates to ensure stable learning. Trained for 5,000 timesteps on historical data.")
+        st.caption("Reinforcement learning algorithm trained for 3,000 timesteps.")
         
         st.markdown("**CNN-LSTM**")
-        st.caption("A hybrid deep learning architecture combining Convolutional Neural Networks (for pattern extraction) with Long Short-Term Memory networks (for sequential dependencies). Captures both spatial and temporal features in market data. Trained for 50 epochs.")
+        st.caption("Hybrid deep learning architecture trained for 30 epochs.")
     
     with col2:
         st.markdown("**A2C (Advantage Actor-Critic)**")
-        st.caption("A reinforcement learning algorithm that simultaneously learns a value function (critic) and policy (actor). More sample-efficient than standard policy gradients and learns to maximize risk-adjusted returns. Trained for 5,000 timesteps.")
+        st.caption("Reinforcement learning algorithm trained for 3,000 timesteps.")
         
         st.markdown("**Transformer**")
-        st.caption("An attention-based neural network architecture that weighs the importance of different time steps in the input sequence. Uses multi-head self-attention mechanisms to capture complex temporal relationships in market data. Trained for 50 epochs.")
+        st.caption("Attention-based neural network trained for 30 epochs.")
     
     # Period analysis
     if 'period_stats' in br:
@@ -673,7 +621,6 @@ if st.session_state.results:
         
         pstats = br['period_stats']
         
-        # TLT/TBT correlation check
         if 'tlt_tbt_correlation' in pstats:
             corr_val = pstats['tlt_tbt_correlation']
             if corr_val < -0.8:
@@ -681,9 +628,8 @@ if st.session_state.results:
             elif corr_val < -0.5:
                 st.info(f"ℹ️ TLT/TBT Correlation: {corr_val:.2f} (Moderate negative)")
             else:
-                st.warning(f"⚠️ TLT/TBT Correlation: {corr_val:.2f} (Weak relationship - reduces switching advantage)")
+                st.warning(f"⚠️ TLT/TBT Correlation: {corr_val:.2f} (Weak relationship)")
         
-        # Individual ETF stats
         st.write("**Individual ETF Performance (OOS Period):**")
         etf_df = pd.DataFrame({
             etf: {

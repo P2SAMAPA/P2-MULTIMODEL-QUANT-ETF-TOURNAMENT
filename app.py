@@ -671,6 +671,6 @@ if st.session_state.results:
                 'Sharpe Ratio': f"{stats['sharpe']:.2f}",
                 'Daily Volatility': f"{stats['std_daily']:.3%}"
             }
-            for etf, stats in pstats.items() if etf != 'tlt_tbt_correlation'
+            
         }).T
         st.dataframe(etf_df, use_container_width=True)

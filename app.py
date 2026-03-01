@@ -21,7 +21,7 @@ st.set_page_config(page_title="Alpha Tournament Pro", layout="wide")
 
 if 'results' not in st.session_state: st.session_state.results = None
 
-TARGET_ETFS = ['TLT', 'TBT', 'VNQ', 'GLD', 'SLV']
+TARGET_ETFS = ['TLT', 'LQD', 'HYG', 'VCIT', 'VNQ', 'GLD', 'SLV']
 DEFAULT_ENSEMBLE_YEARS = [2008, 2010, 2013, 2015, 2019, 2021]
 
 # Get secrets from HF Spaces
@@ -92,11 +92,7 @@ def analyze_period_characteristics(returns_df, test_start_idx):
             'total_return': (1 + etf_rets).prod() - 1
         }
     
-    # Check TLT vs TBT correlation (should be negative)
-    if 'TLT' in returns_df.columns and 'TBT' in returns_df.columns:
-        tlt_tbt_corr = test_returns['TLT'].corr(test_returns['TBT'])
-        stats['tlt_tbt_correlation'] = tlt_tbt_corr
-    
+     
     return stats
 
 def calculate_hold_period_returns(predictions, returns_df, tcost_bps, hold_periods=[1, 3, 5]):
@@ -667,18 +663,7 @@ if st.session_state.results:
     if 'period_stats' in br:
         st.divider()
         st.subheader(f"📊 OOS Period Analysis - {s['best_period']} Training")
-        
-        pstats = br['period_stats']
-        
-        if 'tlt_tbt_correlation' in pstats:
-            corr_val = pstats['tlt_tbt_correlation']
-            if corr_val < -0.8:
-                st.success(f"✅ TLT/TBT Correlation: {corr_val:.2f} (Strong negative - ideal for switching strategy)")
-            elif corr_val < -0.5:
-                st.info(f"ℹ️ TLT/TBT Correlation: {corr_val:.2f} (Moderate negative)")
-            else:
-                st.warning(f"⚠️ TLT/TBT Correlation: {corr_val:.2f} (Weak relationship)")
-        
+                     
         st.write("**Individual ETF Performance (OOS Period):**")
         etf_df = pd.DataFrame({
             etf: {

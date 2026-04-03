@@ -23,7 +23,7 @@ st.set_page_config(page_title="Alpha Tournament Pro", layout="wide")
 if 'results' not in st.session_state: st.session_state.results = None
 
 TARGET_ETFS = ['TLT', 'LQD', 'HYG', 'VCIT', 'VNQ', 'GLD', 'SLV']
-DEFAULT_ENSEMBLE_YEARS = [2008, 2010, 2013, 2015, 2019, 2021]
+DEFAULT_ENSEMBLE_YEARS = [2008, 2011, 2013, 2015, 2017, 2019, 2021,2023,2025]
 
 # Get secrets from HF Spaces
 FRED_API_KEY = os.environ.get("FRED_API_KEY")
